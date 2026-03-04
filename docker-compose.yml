@@ -1,0 +1,114 @@
+version: '3.9'
+services:
+  llama-3-1-70b-instruct:
+    image: nvcr.io/nim/meta/llama-3_1-70b-instruct:latest
+    container_name: nim-llama-3-1-70b-instruct
+    runtime: nvidia
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    environment:
+    - NGC_API_KEY=${NGC_API_KEY}
+    - NVIDIA_VISIBLE_DEVICES=0,1
+    - NIM_INFERENCE_BACKEND=vllm
+    - NIM_CACHE_PATH=/opt/nim/.cache
+    - HF_HOME=/opt/nim/.cache/huggingface
+    - TRANSFORMERS_CACHE=/opt/nim/.cache/huggingface
+    volumes:
+    - /data/nim-cache:/opt/nim/.cache
+    ports:
+    - 8011:8000
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - curl -fsS http://localhost:8000/v1/models || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+    restart: unless-stopped
+  qwen2-5-72b-instruct:
+    image: nvcr.io/nim/qwen/qwen2_5-72b-instruct:latest
+    container_name: nim-qwen2-5-72b-instruct
+    runtime: nvidia
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    environment:
+    - NGC_API_KEY=${NGC_API_KEY}
+    - NVIDIA_VISIBLE_DEVICES=2,3
+    - NIM_INFERENCE_BACKEND=vllm
+    - NIM_CACHE_PATH=/opt/nim/.cache
+    - HF_HOME=/opt/nim/.cache/huggingface
+    - TRANSFORMERS_CACHE=/opt/nim/.cache/huggingface
+    volumes:
+    - /data/nim-cache:/opt/nim/.cache
+    ports:
+    - 8012:8000
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - curl -fsS http://localhost:8000/v1/models || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+    restart: unless-stopped
+  mistral-large-instruct:
+    image: nvcr.io/nim/mistralai/mistral-large-instruct:latest
+    container_name: nim-mistral-large-instruct
+    runtime: nvidia
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    environment:
+    - NGC_API_KEY=${NGC_API_KEY}
+    - NVIDIA_VISIBLE_DEVICES=4,5
+    - NIM_INFERENCE_BACKEND=vllm
+    - NIM_CACHE_PATH=/opt/nim/.cache
+    - HF_HOME=/opt/nim/.cache/huggingface
+    - TRANSFORMERS_CACHE=/opt/nim/.cache/huggingface
+    volumes:
+    - /data/nim-cache:/opt/nim/.cache
+    ports:
+    - 8013:8000
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - curl -fsS http://localhost:8000/v1/models || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+    restart: unless-stopped
+  nemotron-4-340b-instruct:
+    image: nvcr.io/nim/nvidia/nemotron-4-340b-instruct:latest
+    container_name: nim-nemotron-4-340b-instruct
+    runtime: nvidia
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    environment:
+    - NGC_API_KEY=${NGC_API_KEY}
+    - NVIDIA_VISIBLE_DEVICES=6,7
+    - NIM_INFERENCE_BACKEND=vllm
+    - NIM_CACHE_PATH=/opt/nim/.cache
+    - HF_HOME=/opt/nim/.cache/huggingface
+    - TRANSFORMERS_CACHE=/opt/nim/.cache/huggingface
+    volumes:
+    - /data/nim-cache:/opt/nim/.cache
+    ports:
+    - 8014:8000
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - curl -fsS http://localhost:8000/v1/models || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+    restart: unless-stopped

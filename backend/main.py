@@ -1,199 +1,101 @@
-"""FastAPI backend for LLM Council."""
+"""FastAPI backend for local multi-round LLM council."""
+
+from __future__ import annotations
+
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from typing import List, Dict, Any
-import uuid
-import json
-import asyncio
+from pydantic import BaseModel, Field
 
-from . import storage
-from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings
+from .config import CHAIRMAN_MODEL, COUNCIL_MODELS, ROUNDS
+from .council import run_batch_deliberation, run_deliberation
+from .inference import health_check_all
+from .storage import load_result
+
 
 app = FastAPI(title="LLM Council API")
 
-# Enable CORS for local development
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+class DeliberateRequest(BaseModel):
+    """Request body for single-prompt deliberation."""
+
+    prompt: str = Field(..., min_length=1)
+    rounds: int | None = Field(default=None, ge=1)
 
 
-class CreateConversationRequest(BaseModel):
-    """Request to create a new conversation."""
-    pass
+class BatchRequest(BaseModel):
+    """Request body for batch deliberation."""
 
-
-class SendMessageRequest(BaseModel):
-    """Request to send a message in a conversation."""
-    content: str
-
-
-class ConversationMetadata(BaseModel):
-    """Conversation metadata for list view."""
-    id: str
-    created_at: str
-    title: str
-    message_count: int
-
-
-class Conversation(BaseModel):
-    """Full conversation with all messages."""
-    id: str
-    created_at: str
-    title: str
-    messages: List[Dict[str, Any]]
+    prompts: list[str] = Field(..., min_length=1)
+    rounds: int | None = Field(default=None, ge=1)
 
 
 @app.get("/")
-async def root():
-    """Health check endpoint."""
-    return {"status": "ok", "service": "LLM Council API"}
+async def root() -> dict[str, str]:
+    """Basic service info endpoint."""
+    return {"status": "ok", "service": "LLM Council API", "mode": "local-nim"}
 
 
-@app.get("/api/conversations", response_model=List[ConversationMetadata])
-async def list_conversations():
-    """List all conversations (metadata only)."""
-    return storage.list_conversations()
+@app.post("/api/deliberate")
+async def deliberate(request: DeliberateRequest) -> dict[str, Any]:
+    """Run N-round deliberation for one prompt and return full stored result."""
+    prompt = request.prompt.strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt cannot be empty")
+
+    try:
+        return await run_deliberation(prompt=prompt, rounds=request.rounds or ROUNDS)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/conversations", response_model=Conversation)
-async def create_conversation(request: CreateConversationRequest):
-    """Create a new conversation."""
-    conversation_id = str(uuid.uuid4())
-    conversation = storage.create_conversation(conversation_id)
-    return conversation
+@app.post("/api/batch")
+async def deliberate_batch(request: BatchRequest) -> dict[str, Any]:
+    """Run N-round deliberation sequentially for a list of prompts."""
+    prompts = [prompt.strip() for prompt in request.prompts if prompt.strip()]
+    if not prompts:
+        raise HTTPException(status_code=400, detail="prompts must include at least one non-empty item")
+
+    try:
+        return await run_batch_deliberation(prompts=prompts, rounds=request.rounds or ROUNDS)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/conversations/{conversation_id}", response_model=Conversation)
-async def get_conversation(conversation_id: str):
-    """Get a specific conversation with all its messages."""
-    conversation = storage.get_conversation(conversation_id)
-    if conversation is None:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    return conversation
+@app.get("/api/batch/{batch_id}")
+async def get_batch(batch_id: str) -> dict[str, Any]:
+    """Load all prompt results for a stored batch."""
+    result = load_result(batch_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="batch not found")
+    return result
 
 
-@app.post("/api/conversations/{conversation_id}/message")
-async def send_message(conversation_id: str, request: SendMessageRequest):
-    """
-    Send a message and run the 3-stage council process.
-    Returns the complete response with all stages.
-    """
-    # Check if conversation exists
-    conversation = storage.get_conversation(conversation_id)
-    if conversation is None:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-
-    # Check if this is the first message
-    is_first_message = len(conversation["messages"]) == 0
-
-    # Add user message
-    storage.add_user_message(conversation_id, request.content)
-
-    # If this is the first message, generate a title
-    if is_first_message:
-        title = await generate_conversation_title(request.content)
-        storage.update_conversation_title(conversation_id, title)
-
-    # Run the 3-stage council process
-    stage1_results, stage2_results, stage3_result, metadata = await run_full_council(
-        request.content
-    )
-
-    # Add assistant message with all stages
-    storage.add_assistant_message(
-        conversation_id,
-        stage1_results,
-        stage2_results,
-        stage3_result
-    )
-
-    # Return the complete response with metadata
+@app.get("/api/models")
+async def get_models() -> dict[str, Any]:
+    """Return configured models with live health checks."""
+    statuses = await health_check_all(COUNCIL_MODELS)
     return {
-        "stage1": stage1_results,
-        "stage2": stage2_results,
-        "stage3": stage3_result,
-        "metadata": metadata
+        "models": statuses,
+        "chairman": CHAIRMAN_MODEL,
+        "count": len(statuses),
     }
 
 
-@app.post("/api/conversations/{conversation_id}/message/stream")
-async def send_message_stream(conversation_id: str, request: SendMessageRequest):
-    """
-    Send a message and stream the 3-stage council process.
-    Returns Server-Sent Events as each stage completes.
-    """
-    # Check if conversation exists
-    conversation = storage.get_conversation(conversation_id)
-    if conversation is None:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-
-    # Check if this is the first message
-    is_first_message = len(conversation["messages"]) == 0
-
-    async def event_generator():
-        try:
-            # Add user message
-            storage.add_user_message(conversation_id, request.content)
-
-            # Start title generation in parallel (don't await yet)
-            title_task = None
-            if is_first_message:
-                title_task = asyncio.create_task(generate_conversation_title(request.content))
-
-            # Stage 1: Collect responses
-            yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
-            stage1_results = await stage1_collect_responses(request.content)
-            yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results})}\n\n"
-
-            # Stage 2: Collect rankings
-            yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
-            stage2_results, label_to_model = await stage2_collect_rankings(request.content, stage1_results)
-            aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
-            yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
-
-            # Stage 3: Synthesize final answer
-            yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
-            stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results)
-            yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
-
-            # Wait for title generation if it was started
-            if title_task:
-                title = await title_task
-                storage.update_conversation_title(conversation_id, title)
-                yield f"data: {json.dumps({'type': 'title_complete', 'data': {'title': title}})}\n\n"
-
-            # Save complete assistant message
-            storage.add_assistant_message(
-                conversation_id,
-                stage1_results,
-                stage2_results,
-                stage3_result
-            )
-
-            # Send completion event
-            yield f"data: {json.dumps({'type': 'complete'})}\n\n"
-
-        except Exception as e:
-            # Send error event
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-        }
-    )
+@app.get("/api/health")
+async def health() -> dict[str, Any]:
+    """Return overall system readiness based on model endpoint health."""
+    statuses = await health_check_all(COUNCIL_MODELS)
+    all_healthy = all(status.get("healthy") for status in statuses)
+    return {
+        "ready": all_healthy,
+        "model_count": len(statuses),
+        "healthy_models": sum(1 for status in statuses if status.get("healthy")),
+        "models": statuses,
+    }
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8001)
