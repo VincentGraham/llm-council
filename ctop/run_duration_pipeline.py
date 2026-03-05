@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 import tempfile
-from typing import Any
+from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 import pandas as pd
@@ -219,7 +219,13 @@ class ProgressReporter:
         self._latest.set_description_str("Latest: waiting...")
         self._latest.refresh()
 
-    def update(self, latest_line: str, metrics: OnlineTrialMetrics) -> None:
+    def extend_total(self, units: int) -> None:
+        if not self.enabled or self._bar is None or units <= 0:
+            return
+        self._bar.total = (self._bar.total or 0) + units
+        self._bar.refresh()
+
+    def advance_round(self, latest_line: str, metrics: OnlineTrialMetrics, units: int = 1) -> None:
         if not self.enabled or self._bar is None or self._latest is None:
             return
 
@@ -231,7 +237,7 @@ class ProgressReporter:
             postfix["rmse"] = f"{metrics.rmse:.3f}" if metrics.rmse is not None else "n/a"
             postfix["f1@12m"] = f"{metrics.f1_short:.3f}" if metrics.f1_short is not None else "n/a"
         self._bar.set_postfix(postfix, refresh=False)
-        self._bar.update(1)
+        self._bar.update(max(0, units))
 
         trimmed = " ".join(latest_line.split())
         if len(trimmed) > 220:
@@ -552,6 +558,8 @@ async def _run_trial(
     rounds: int,
     counterfactual_enabled: bool,
     allow_fuzzy_quotes: bool,
+    round_progress_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    extend_progress_total_callback: Callable[[int], None] | None = None,
 ) -> list[dict[str, Any]]:
     nct_id = _clean_text(row.get("nct_id")) or f"trial-{trial_index:05d}"
     true_duration_days = _to_int(row.get("duration_days"))
@@ -587,10 +595,21 @@ async def _run_trial(
     }
 
     rows: list[dict[str, Any]] = []
+
+    async def _baseline_round_progress(event: dict[str, Any]) -> None:
+        if round_progress_callback is None:
+            return
+        payload = dict(event)
+        payload["run_type"] = "baseline"
+        payload["nct_id"] = nct_id
+        payload["trial_index"] = trial_index
+        await round_progress_callback(payload)
+
     try:
         baseline_result = await run_deliberation(
             rounds=rounds,
             deliberation_input=deliberation_input,
+            round_progress_callback=_baseline_round_progress if round_progress_callback else None,
         )
     except Exception as exc:  # pylint: disable=broad-except
         rows.append(
@@ -644,6 +663,10 @@ async def _run_trial(
     if not evidence_items:
         return rows
 
+    if extend_progress_total_callback is not None:
+        expected_cf_items = sum(1 for evidence in evidence_items if _clean_text(evidence.get("evidence_id")))
+        extend_progress_total_callback(expected_cf_items * rounds)
+
     if not baseline_batch_id or not baseline_prompt_id:
         for cf_index, evidence in enumerate(evidence_items, start=1):
             rows.append(
@@ -695,6 +718,18 @@ async def _run_trial(
             "trial_index": trial_index,
             "masked_evidence_id": evidence_id,
         }
+
+        async def _counterfactual_round_progress(event: dict[str, Any]) -> None:
+            if round_progress_callback is None:
+                return
+            payload = dict(event)
+            payload["run_type"] = "counterfactual"
+            payload["nct_id"] = nct_id
+            payload["trial_index"] = trial_index
+            payload["cf_index"] = cf_index
+            payload["masked_evidence_id"] = evidence_id
+            await round_progress_callback(payload)
+
         try:
             cf_result = await run_counterfactual_deliberation(
                 source_batch_id=baseline_batch_id,
@@ -703,6 +738,7 @@ async def _run_trial(
                 rounds=rounds,
                 allow_fuzzy_quotes=allow_fuzzy_quotes,
                 metadata=cf_metadata,
+                round_progress_callback=_counterfactual_round_progress if round_progress_callback else None,
             )
         except Exception as exc:  # pylint: disable=broad-except
             rows.append(
@@ -947,18 +983,48 @@ async def run_duration_pipeline(
         ema_alpha=ema_alpha,
         short_threshold_months=short_threshold_months,
     )
-    progress = ProgressReporter(total=len(input_df), enabled=show_progress)
+    progress = ProgressReporter(total=len(input_df) * max(1, rounds), enabled=show_progress)
 
     try:
         for trial_index, (_, series) in enumerate(input_df.iterrows(), start=1):
+            trial_dict = series.to_dict()
+            nct_id = _clean_text(trial_dict.get("nct_id")) or f"trial-{trial_index:05d}"
+            trial_round_updates = 0
+
+            async def on_round_progress(event: dict[str, Any]) -> None:
+                nonlocal trial_round_updates
+                trial_round_updates += 1
+                run_type = _clean_text(event.get("run_type")) or "baseline"
+                round_number = _to_int(event.get("round")) or 0
+                rounds_expected = _to_int(event.get("rounds_expected")) or rounds
+                actual_rounds_so_far = _to_int(event.get("actual_rounds_so_far")) or round_number
+                if run_type == "counterfactual":
+                    cf_index = _to_int(event.get("cf_index"))
+                    label = (
+                        f"{nct_id} cf#{cf_index} round {round_number}/{rounds_expected}"
+                        if cf_index is not None
+                        else f"{nct_id} counterfactual round {round_number}/{rounds_expected}"
+                    )
+                else:
+                    label = f"{nct_id} baseline round {round_number}/{rounds_expected}"
+                progress.advance_round(latest_line=label, metrics=metrics, units=1)
+                if bool(event.get("stopped_early")) and rounds_expected > actual_rounds_so_far:
+                    progress.advance_round(
+                        latest_line=f"{label} (early stop)",
+                        metrics=metrics,
+                        units=rounds_expected - actual_rounds_so_far,
+                    )
+
             trial_rows = await _run_trial(
                 run_id=run_id,
                 trial_index=trial_index,
-                row=series.to_dict(),
+                row=trial_dict,
                 prediction_target=prediction_target,
                 rounds=rounds,
                 counterfactual_enabled=counterfactual_enabled,
                 allow_fuzzy_quotes=allow_fuzzy_quotes,
+                round_progress_callback=on_round_progress if show_progress else None,
+                extend_progress_total_callback=progress.extend_total if show_progress else None,
             )
             rows.extend(trial_rows)
 
@@ -968,17 +1034,25 @@ async def run_duration_pipeline(
             )
             if baseline_row is None:
                 baseline_row = {
-                    "nct_id": series.to_dict().get("nct_id"),
+                    "nct_id": nct_id,
                     "status": "error",
                     "error_message": "Baseline row missing",
                 }
+
+            if trial_round_updates == 0 and show_progress:
+                progress.advance_round(
+                    latest_line=f"{nct_id} baseline round {rounds}/{rounds}",
+                    metrics=metrics,
+                    units=rounds,
+                )
             metrics.update(
                 pred_months=_to_float(baseline_row.get("prediction_value_numeric")),
                 true_months=_to_float(baseline_row.get("true_duration_months")),
             )
-            progress.update(
+            progress.advance_round(
                 latest_line=_format_latest_line(baseline_row),
                 metrics=metrics,
+                units=0,
             )
     finally:
         progress.close()

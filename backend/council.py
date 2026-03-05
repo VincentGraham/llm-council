@@ -9,7 +9,7 @@ import re
 from collections import defaultdict
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
-from typing import Any
+from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 from .config import (
@@ -886,6 +886,7 @@ async def run_deliberation(
     prompt_count: int | None = None,
     deliberation_input: dict[str, Any] | None = None,
     counterfactual: dict[str, Any] | None = None,
+    round_progress_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     """Run dynamic deliberation trajectory and persist results."""
     ensure_runtime_config()
@@ -1021,6 +1022,18 @@ async def run_deliberation(
             },
         )
 
+        if round_progress_callback is not None:
+            await round_progress_callback(
+                {
+                    "round": round_number,
+                    "rounds_expected": rounds,
+                    "actual_rounds_so_far": len(all_rounds),
+                    "batch_id": resolved_batch_id,
+                    "prompt_id": resolved_prompt_id,
+                    "stopped_early": bool(stop_triggered),
+                }
+            )
+
         previous_synthesis_text = observer_synthesis.get("response")
         if stop_triggered:
             early_stop_reason = stop_reason
@@ -1136,6 +1149,7 @@ async def run_counterfactual_deliberation(
     rounds: int | None = None,
     allow_fuzzy_quotes: bool = False,
     metadata: dict[str, Any] | None = None,
+    round_progress_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     """Run a full counterfactual rerun with selected evidence masked out."""
     source_result = await _load_prompt_result_async(source_batch_id, source_prompt_id)
@@ -1192,4 +1206,5 @@ async def run_counterfactual_deliberation(
         rounds=rerun_rounds,
         deliberation_input=counterfactual_request,
         counterfactual=counterfactual_meta,
+        round_progress_callback=round_progress_callback,
     )
