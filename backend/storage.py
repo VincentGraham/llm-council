@@ -10,6 +10,9 @@ from typing import Any
 from .config import DATA_DIR
 
 
+CURRENT_SCHEMA_VERSION = 2
+
+
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -54,6 +57,30 @@ def _prompt_preview(prompt: str, max_len: int = 120) -> str:
     if len(clean) <= max_len:
         return clean
     return f"{clean[:max_len - 3]}..."
+
+
+def _normalize_request(request_payload: dict[str, Any] | None, prompt: str) -> dict[str, Any]:
+    payload = dict(request_payload or {})
+    payload.setdefault("prompt", prompt)
+    payload.setdefault("trial_text", None)
+    payload.setdefault("prediction_target", None)
+    payload.setdefault("allow_fuzzy_quotes", False)
+    payload.setdefault("metadata", None)
+    return payload
+
+
+def _normalize_result_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    prompt = payload.get("prompt", "")
+    payload.setdefault("schema_version", 1)
+    payload.setdefault("request", _normalize_request(None, prompt))
+    payload.setdefault("evidence_index", [])
+    payload.setdefault("counterfactual", None)
+    payload.setdefault("rounds", [])
+    payload.setdefault("synthesis", None)
+    payload.setdefault("rounds_expected", 1)
+    payload.setdefault("created_at", _utcnow())
+    payload.setdefault("updated_at", payload["created_at"])
+    return payload
 
 
 def _load_or_create_manifest(batch_id: str) -> dict[str, Any]:
@@ -118,20 +145,28 @@ def _load_or_create_prompt_result(
     rounds_expected: int,
     prompt_index: int | None,
     prompt_count: int | None,
+    request_payload: dict[str, Any] | None,
+    counterfactual: dict[str, Any] | None,
 ) -> dict[str, Any]:
     path = _prompt_result_path(batch_id, prompt_id, create=True)
     payload = _read_json(path)
     if payload is not None:
+        payload = _normalize_result_payload(payload)
         if prompt_index is not None:
             payload["prompt_index"] = prompt_index
         if prompt_count is not None:
             payload["prompt_count"] = prompt_count
         payload["rounds_expected"] = rounds_expected
         payload["prompt"] = prompt
+        if request_payload is not None:
+            payload["request"] = _normalize_request(request_payload, prompt)
+        if counterfactual is not None:
+            payload["counterfactual"] = counterfactual
         return payload
 
     now = _utcnow()
     return {
+        "schema_version": CURRENT_SCHEMA_VERSION,
         "batch_id": batch_id,
         "prompt_id": prompt_id,
         "prompt": prompt,
@@ -140,6 +175,9 @@ def _load_or_create_prompt_result(
         "created_at": now,
         "updated_at": now,
         "rounds_expected": rounds_expected,
+        "request": _normalize_request(request_payload, prompt),
+        "evidence_index": [],
+        "counterfactual": counterfactual,
         "rounds": [],
         "synthesis": None,
     }
@@ -153,6 +191,8 @@ def save_round(
     rounds_expected: int,
     prompt_index: int | None = None,
     prompt_count: int | None = None,
+    request_payload: dict[str, Any] | None = None,
+    counterfactual: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Persist one deliberation round for a prompt result."""
     round_number = round_data.get("round")
@@ -166,8 +206,11 @@ def save_round(
         rounds_expected=rounds_expected,
         prompt_index=prompt_index,
         prompt_count=prompt_count,
+        request_payload=request_payload,
+        counterfactual=counterfactual,
     )
 
+    result["schema_version"] = CURRENT_SCHEMA_VERSION
     result["rounds"] = [
         existing for existing in result["rounds"] if existing.get("round") != round_number
     ]
@@ -197,6 +240,9 @@ def save_synthesis(
     rounds_expected: int,
     prompt_index: int | None = None,
     prompt_count: int | None = None,
+    request_payload: dict[str, Any] | None = None,
+    counterfactual: dict[str, Any] | None = None,
+    evidence_index: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Persist chairman synthesis for a prompt result."""
     result = _load_or_create_prompt_result(
@@ -206,9 +252,14 @@ def save_synthesis(
         rounds_expected=rounds_expected,
         prompt_index=prompt_index,
         prompt_count=prompt_count,
+        request_payload=request_payload,
+        counterfactual=counterfactual,
     )
 
+    result["schema_version"] = CURRENT_SCHEMA_VERSION
     result["synthesis"] = synthesis
+    if evidence_index is not None:
+        result["evidence_index"] = evidence_index
     result["updated_at"] = _utcnow()
     _write_json(_prompt_result_path(batch_id, prompt_id, create=True), result)
 
@@ -224,6 +275,31 @@ def save_synthesis(
     return result
 
 
+def update_prompt_result(
+    batch_id: str,
+    prompt_id: str,
+    updates: dict[str, Any],
+) -> dict[str, Any]:
+    """Update arbitrary top-level fields for one prompt result."""
+    payload = load_prompt_result(batch_id, prompt_id)
+    if payload is None:
+        raise ValueError(f"Prompt result not found: {batch_id}/{prompt_id}")
+
+    payload.update(updates)
+    payload["schema_version"] = CURRENT_SCHEMA_VERSION
+    payload["updated_at"] = _utcnow()
+    _write_json(_prompt_result_path(batch_id, prompt_id, create=True), payload)
+    return payload
+
+
+def load_prompt_result(batch_id: str, prompt_id: str) -> dict[str, Any] | None:
+    """Load a single prompt result with backward-compatible normalization."""
+    payload = _read_json(_prompt_result_path(batch_id, prompt_id, create=False))
+    if payload is None:
+        return None
+    return _normalize_result_payload(payload)
+
+
 def load_result(batch_id: str, prompt_id: str | None = None) -> dict[str, Any] | None:
     """
     Load result for one prompt, or load all prompt results for a batch.
@@ -233,7 +309,7 @@ def load_result(batch_id: str, prompt_id: str | None = None) -> dict[str, Any] |
         If prompt_id is unset: dict with `batch` + `results` or None.
     """
     if prompt_id:
-        return _read_json(_prompt_result_path(batch_id, prompt_id, create=False))
+        return load_prompt_result(batch_id, prompt_id)
 
     batch_path = _batch_dir(batch_id, create=False)
     if not batch_path.exists():
@@ -252,7 +328,7 @@ def load_result(batch_id: str, prompt_id: str | None = None) -> dict[str, Any] |
     for path in result_files:
         payload = _read_json(path)
         if payload is not None:
-            results.append(payload)
+            results.append(_normalize_result_payload(payload))
 
     results.sort(
         key=lambda item: (

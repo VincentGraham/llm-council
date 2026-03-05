@@ -2,14 +2,15 @@
 
 ![llmcouncil](header.jpg)
 
-Backend-only refactor of LLM Council that runs local NVIDIA NIM containers (vLLM backend) and orchestrates configurable multi-round deliberation.
+Backend-only LLM council that runs local NVIDIA NIM containers (vLLM backend), supports multi-round deliberation, and now captures structured prediction evidence for explainability and counterfactual reruns.
 
 ## What Changed
 
-- Replaced OpenRouter cloud inference with local OpenAI-compatible NIM endpoints.
-- Replaced fixed 3-stage flow with configurable `N` rounds from `models.yaml`.
-- Added batch deliberation endpoints and layered JSON storage under `/data/results`.
-- Removed frontend dependency from startup flow.
+- Local NIM/OpenAI-compatible inference (no OpenRouter).
+- Configurable N-round council deliberation.
+- Structured prediction + evidence extraction (3-5 evidence items) for every model response and synthesis.
+- Evidence index endpoint for research workflows.
+- Counterfactual endpoint to mask selected evidence spans and rerun the full council.
 
 ## Configuration
 
@@ -27,11 +28,12 @@ Set:
 
 ### 2. Edit `models.yaml`
 
-`models.yaml` is the single source of truth for:
+`models.yaml` is the source of truth for:
 
 - round count (`rounds`)
 - model names
-- request model ids (`request_model`, optional)
+- request model IDs (`request_model`, optional)
+- extractor model (`extractor_model`, optional, defaults to chairman)
 - NIM images
 - GPU assignments
 - ports
@@ -55,38 +57,107 @@ uv sync
 `start.sh`:
 
 1. runs `docker compose up -d`
-2. starts the FastAPI backend on `http://localhost:8001`
-3. waits until `/api/health` reports all model endpoints ready
+2. starts FastAPI on `http://localhost:8001`
+3. waits until `/api/health` reports model readiness
 
 ## API Endpoints
 
-- `POST /api/deliberate` - run one prompt through N rounds
-- `POST /api/batch` - run a list of prompts sequentially
-- `GET /api/batch/{batch_id}` - fetch stored batch results
-- `GET /api/models` - model config + live health checks
-- `GET /api/health` - overall readiness
+- `POST /api/deliberate`
+- `POST /api/batch`
+- `POST /api/counterfactual`
+- `GET /api/batch/{batch_id}`
+- `GET /api/evidence/{batch_id}/{prompt_id}`
+- `GET /api/models`
+- `GET /api/health`
+
+### Deliberate Request
+
+```json
+{
+  "prompt": "optional extra instruction",
+  "trial_text": "optional trial textblock",
+  "prediction_target": "duration|price|success|...",
+  "rounds": 3,
+  "allow_fuzzy_quotes": false,
+  "metadata": {"study_id": "NCT..."}
+}
+```
+
+At least one of `prompt` or `trial_text` is required.
+
+### Batch Request
+
+Use exactly one of:
+
+1. Legacy prompt list:
+
+```json
+{
+  "prompts": ["prompt a", "prompt b"],
+  "rounds": 3
+}
+```
+
+2. Structured item list:
+
+```json
+{
+  "items": [
+    {"trial_text": "...", "prediction_target": "success"},
+    {"prompt": "..."}
+  ],
+  "rounds": 3
+}
+```
+
+### Counterfactual Request
+
+```json
+{
+  "source_batch_id": "...",
+  "source_prompt_id": "...",
+  "evidence_ids": ["r1-model-ev-01"],
+  "selectors": {
+    "models": ["qwen2.5-72b-instruct"],
+    "rounds": [1, 2],
+    "source_tags": ["primary_endpoint"],
+    "include_synthesis": false
+  },
+  "rounds": 3,
+  "allow_fuzzy_quotes": false,
+  "metadata": {"experiment": "mask-v1"}
+}
+```
+
+Selection is union of explicit `evidence_ids` and selector matches.
 
 ## Storage Layout
 
-Results are stored at `${DATA_DIR}` (default `/data/results`):
+Results are stored at `${DATA_DIR}` (default `/data/results`) with per-batch directories.
 
-- one directory per batch id
-- `batch.json` manifest
-- one JSON file per prompt containing:
-  - `rounds[]`
-  - `synthesis`
-  - metadata (`batch_id`, `prompt_id`, timestamps)
+Each prompt result now includes:
+
+- `schema_version`
+- `request`
+- `rounds[]`
+- `synthesis`
+- `evidence_index[]`
+- `counterfactual` (when derived from masked rerun)
+
+Per response includes:
+
+- `prediction`
+- `evidence[]`
+- `structured_json`
+- `structured_parse_status`
+- `structured_parse_errors`
+- `response` (narrative text)
 
 ## Verification
 
 ```bash
-python -c "from backend.config import MODELS; print(MODELS)"
+python -c "from backend.config import MODELS, EXTRACTOR_MODEL; print(len(MODELS), EXTRACTOR_MODEL)"
 python generate_compose.py
 uv run python -m backend.main
-```
-
-Then test endpoints with `curl`:
-
-```bash
 curl http://localhost:8001/api/health
 ```

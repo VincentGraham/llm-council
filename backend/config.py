@@ -16,6 +16,8 @@ load_dotenv()
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODELS_YAML_PATH = Path(os.getenv("MODELS_YAML", PROJECT_ROOT / "models.yaml"))
 DATA_DIR = os.getenv("DATA_DIR", "/data/results")
+EVIDENCE_MIN_ITEMS = 3
+EVIDENCE_MAX_ITEMS = 5
 
 
 def _load_models_config(path: Path) -> dict[str, Any]:
@@ -38,6 +40,9 @@ def _load_models_config(path: Path) -> dict[str, Any]:
     rounds = data.get("rounds", 3)
     if not isinstance(rounds, int) or rounds < 1:
         raise ValueError("'rounds' must be an integer >= 1.")
+    extractor_model = data.get("extractor_model")
+    if extractor_model is not None and not isinstance(extractor_model, str):
+        raise ValueError("'extractor_model' must be a string when provided.")
 
     seen_names = set()
     for index, model in enumerate(models):
@@ -67,7 +72,10 @@ def _load_models_config(path: Path) -> dict[str, Any]:
 
         model.setdefault("chairman", False)
 
-    return {"rounds": rounds, "models": models}
+    if extractor_model and extractor_model not in seen_names:
+        raise ValueError("'extractor_model' must reference one of configured model names.")
+
+    return {"rounds": rounds, "models": models, "extractor_model": extractor_model}
 
 
 _MODELS_CONFIG = _load_models_config(MODELS_YAML_PATH)
@@ -93,3 +101,5 @@ if _chairmen:
     CHAIRMAN_MODEL = _chairmen[0]
 else:
     CHAIRMAN_MODEL = COUNCIL_MODELS[0]
+
+EXTRACTOR_MODEL = _MODELS_CONFIG.get("extractor_model") or CHAIRMAN_MODEL

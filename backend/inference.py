@@ -28,7 +28,7 @@ def _message_content_to_text(content: Any) -> str:
 async def query_model(
     model: str,
     messages: list[dict[str, str]],
-    timeout: float = 120.0,
+    timeout: float = 300.0,
     endpoint: str | None = None,
 ) -> dict[str, Any] | None:
     """
@@ -70,7 +70,7 @@ async def query_model(
 async def query_models_parallel(
     models: list[str],
     messages_by_model: dict[str, list[dict[str, str]]] | list[dict[str, str]],
-    timeout: float = 120.0,
+    timeout: float = 300.0,
 ) -> dict[str, dict[str, Any] | None]:
     """Query multiple models in parallel."""
     tasks = []
