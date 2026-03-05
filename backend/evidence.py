@@ -17,6 +17,8 @@ from .inference import query_model
 
 
 JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE)
+FUZZY_MAX_SOURCE_CHARS = 50000
+FUZZY_MAX_EVALUATIONS = 2000
 
 
 def _normalize_whitespace(value: str) -> str:
@@ -181,6 +183,10 @@ def _iter_window_starts(source_len: int, window_len: int) -> list[int]:
     return starts
 
 
+def _keyword_tokens(value: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]+", value.lower()) if len(token) >= 5}
+
+
 def _find_fuzzy_span(quote: str, source_text: str) -> tuple[int, int] | None:
     quote_norm = _normalize_whitespace(quote).lower()
     if not quote_norm:
@@ -191,12 +197,22 @@ def _find_fuzzy_span(quote: str, source_text: str) -> tuple[int, int] | None:
     minimum_viable_quick = 0.5
 
     source_len = len(source_text)
+    if source_len > FUZZY_MAX_SOURCE_CHARS:
+        return None
+
+    quote_keywords = _keyword_tokens(quote_norm)
+    evaluated = 0
     for window_len in _window_lengths(len(quote.strip()), source_len):
         for start in _iter_window_starts(source_len, window_len):
+            evaluated += 1
+            if evaluated > FUZZY_MAX_EVALUATIONS:
+                break
             end = start + window_len
             candidate = source_text[start:end]
             candidate_norm = _normalize_whitespace(candidate).lower()
             if not candidate_norm:
+                continue
+            if quote_keywords and not any(keyword in candidate_norm for keyword in quote_keywords):
                 continue
 
             matcher.set_seq2(candidate_norm)
@@ -211,6 +227,8 @@ def _find_fuzzy_span(quote: str, source_text: str) -> tuple[int, int] | None:
                 best = (score, start, end)
                 if score >= 0.995:
                     return start, end
+        if evaluated > FUZZY_MAX_EVALUATIONS:
+            break
 
     if best and best[0] >= 0.84:
         return best[1], best[2]

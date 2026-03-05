@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -16,6 +18,7 @@ from .config import (
     COUNCIL_MODELS,
     EARLY_STOP_ENABLED_DEFAULT,
     EARLY_STOP_MIN_ROUNDS,
+    ensure_runtime_config,
     ROUND1_INFERENCE_PARAMS,
     ROUND_N_INFERENCE_PARAMS,
     OBSERVER_CHAIRMAN_MODE,
@@ -40,6 +43,8 @@ from .storage import (
 )
 
 logger = logging.getLogger(__name__)
+ROUND_N_CONTEXT_BUDGET_CHARS = max(1000, int(os.getenv("ROUND_N_CONTEXT_BUDGET_CHARS", "12000")))
+BATCH_MAX_CONCURRENCY_DEFAULT = max(1, int(os.getenv("BATCH_MAX_CONCURRENCY", "2")))
 
 
 def _utcnow() -> str:
@@ -51,6 +56,36 @@ def _label_for_index(index: int) -> str:
     if index < len(alphabet):
         return f"Response {alphabet[index]}"
     return f"Response {index + 1}"
+
+
+def _resolve_council_members() -> list[str]:
+    """Resolve active deliberating members for a run."""
+    members = list(COUNCIL_MODELS)
+    if OBSERVER_CHAIRMAN_MODE:
+        observer_members = [model for model in members if model != CHAIRMAN_MODEL]
+        if observer_members:
+            return observer_members
+    return members
+
+
+async def _save_round_async(**kwargs: Any) -> dict[str, Any]:
+    return await asyncio.to_thread(save_round, **kwargs)
+
+
+async def _save_synthesis_async(**kwargs: Any) -> dict[str, Any]:
+    return await asyncio.to_thread(save_synthesis, **kwargs)
+
+
+async def _update_prompt_result_async(**kwargs: Any) -> dict[str, Any]:
+    return await asyncio.to_thread(update_prompt_result, **kwargs)
+
+
+async def _load_result_async(batch_id: str) -> dict[str, Any] | None:
+    return await asyncio.to_thread(load_result, batch_id)
+
+
+async def _load_prompt_result_async(batch_id: str, prompt_id: str) -> dict[str, Any] | None:
+    return await asyncio.to_thread(load_prompt_result, batch_id, prompt_id)
 
 
 def _normalize_deliberation_input(
@@ -297,21 +332,65 @@ def _summarize_usage(
 def _format_responses_with_labels(
     responses: list[dict[str, Any]],
     exclude_model: str | None = None,
+    label_by_model: dict[str, str] | None = None,
+    model_order: list[str] | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     lines = []
     mapping = {}
 
-    filtered = [
-        response
+    response_by_model = {
+        response.get("model"): response
         for response in responses
-        if response.get("model") != exclude_model and response.get("response")
+        if isinstance(response.get("model"), str)
+    }
+    ordered_models = model_order or [
+        response.get("model")
+        for response in responses
+        if isinstance(response.get("model"), str)
     ]
-    for index, response in enumerate(filtered):
-        label = _label_for_index(index)
-        mapping[label] = response["model"]
+    label_index = 0
+    for model in ordered_models:
+        if model == exclude_model:
+            continue
+        response = response_by_model.get(model)
+        if not response or not response.get("response"):
+            continue
+        label = (label_by_model or {}).get(model) or _label_for_index(label_index)
+        mapping[label] = model
         lines.append(f"{label}:\n{response['response']}")
+        label_index += 1
 
     return lines, mapping
+
+
+def _build_peer_label_map(council_members: list[str], model_name: str) -> dict[str, str]:
+    peers = [member for member in council_members if member != model_name]
+    return {peer: _label_for_index(index) for index, peer in enumerate(peers)}
+
+
+def _truncate_prior_sections(prior_sections: list[str], max_chars: int) -> str:
+    if not prior_sections:
+        return "No prior responses available."
+    if max_chars <= 0:
+        return "\n\n".join(prior_sections)
+
+    selected_reversed: list[str] = []
+    used_chars = 0
+    for section in reversed(prior_sections):
+        section_chars = len(section) + 2
+        if selected_reversed and (used_chars + section_chars) > max_chars:
+            continue
+        selected_reversed.append(section)
+        used_chars += section_chars
+
+    selected = list(reversed(selected_reversed))
+    omitted_count = len(prior_sections) - len(selected)
+    if omitted_count > 0:
+        selected.insert(
+            0,
+            f"[{omitted_count} earlier round(s) omitted due to context budget of {max_chars} characters.]",
+        )
+    return "\n\n".join(selected)
 
 
 def parse_ranking_from_text(ranking_text: str) -> list[str]:
@@ -371,16 +450,29 @@ def calculate_aggregate_rankings(
 def _prediction_signature(prediction: dict[str, Any] | None) -> str | None:
     if not isinstance(prediction, dict):
         return None
-    if prediction.get("label"):
-        return f"label:{str(prediction['label']).strip().lower()}"
-    if prediction.get("probability") is not None:
-        return f"prob:{round(float(prediction['probability']), 3)}"
-    if prediction.get("value_numeric") is not None:
-        unit = prediction.get("unit") or ""
-        return f"num:{round(float(prediction['value_numeric']), 3)}:{unit}"
-    if prediction.get("value_text"):
-        return f"text:{str(prediction['value_text']).strip().lower()}"
-    return None
+    parts: list[str] = []
+    label = prediction.get("label")
+    if label:
+        parts.append(f"label:{str(label).strip().lower()}")
+    probability = prediction.get("probability")
+    if probability is not None:
+        try:
+            parts.append(f"prob:{round(float(probability), 3)}")
+        except (TypeError, ValueError):
+            pass
+    numeric_value = prediction.get("value_numeric")
+    if numeric_value is not None:
+        try:
+            unit = str(prediction.get("unit") or "").strip().lower()
+            parts.append(f"num:{round(float(numeric_value), 3)}:{unit}")
+        except (TypeError, ValueError):
+            pass
+    value_text = prediction.get("value_text")
+    if value_text:
+        parts.append(f"text:{str(value_text).strip().lower()}")
+    if not parts:
+        return None
+    return "|".join(parts)
 
 
 def _round_consensus_ratio(round_responses: list[dict[str, Any]]) -> float:
@@ -454,9 +546,11 @@ async def _parse_and_attach_structure(
 
 async def round_1(
     request_payload: dict[str, Any],
+    council_members: list[str] | None = None,
     generation_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Round 1: all council models answer the prompt independently."""
+    active_members = list(council_members or COUNCIL_MODELS)
     base_prompt = _primary_prompt_from_request(request_payload)
     messages = [
         {"role": "system", "content": COUNCIL_MEMBER_SYSTEM_PROMPT},
@@ -466,13 +560,13 @@ async def round_1(
         },
     ]
     responses = await query_models_parallel(
-        COUNCIL_MODELS,
+        active_members,
         messages,
         generation_params=generation_params,
     )
 
     round_responses = []
-    for model in COUNCIL_MODELS:
+    for model in active_members:
         response = responses.get(model)
         if response is None:
             round_responses.append(
@@ -527,12 +621,32 @@ def _build_round_n_prompt(
     prior_rounds: list[dict[str, Any]],
     prior_syntheses: list[dict[str, Any]] | None,
     share_synthesis_with_members: bool,
+    council_members: list[str] | None = None,
 ) -> tuple[str, dict[str, str]]:
+    member_order = council_members
+    if member_order is None:
+        inferred_members: list[str] = []
+        for prior_round in prior_rounds:
+            for response in prior_round.get("responses", []):
+                model = response.get("model")
+                if isinstance(model, str) and model not in inferred_members:
+                    inferred_members.append(model)
+        member_order = inferred_members or COUNCIL_MODELS
+
+    peer_order = [
+        member
+        for member in member_order
+        if member != model_name
+    ]
+    peer_label_map = _build_peer_label_map(member_order, model_name)
     prior_sections = []
 
     for prior_round in prior_rounds:
         response_lines, _ = _format_responses_with_labels(
-            prior_round["responses"], exclude_model=model_name
+            prior_round["responses"],
+            exclude_model=model_name,
+            label_by_model=peer_label_map,
+            model_order=peer_order,
         )
         if response_lines:
             prior_sections.append(
@@ -543,9 +657,11 @@ def _build_round_n_prompt(
     latest_response_lines, latest_label_to_model = _format_responses_with_labels(
         prior_rounds[-1]["responses"],
         exclude_model=model_name,
+        label_by_model=peer_label_map,
+        model_order=peer_order,
     )
 
-    prior_text = "\n\n".join(prior_sections) if prior_sections else "No prior responses available."
+    prior_text = _truncate_prior_sections(prior_sections, ROUND_N_CONTEXT_BUDGET_CHARS)
     latest_text = (
         "\n\n".join(latest_response_lines) if latest_response_lines else "No prior responses available."
     )
@@ -587,6 +703,7 @@ async def round_n(
     request_payload: dict[str, Any],
     prior_rounds: list[dict[str, Any]],
     n: int,
+    council_members: list[str] | None = None,
     prior_syntheses: list[dict[str, Any]] | None = None,
     share_synthesis_with_members: bool = False,
     generation_params: dict[str, Any] | None = None,
@@ -596,16 +713,18 @@ async def round_n(
         raise ValueError("round_n is only valid for rounds >= 2.")
     if not prior_rounds:
         raise ValueError("prior_rounds is required for round_n.")
+    active_members = list(council_members or COUNCIL_MODELS)
 
     messages_by_model: dict[str, list[dict[str, str]]] = {}
     label_maps: dict[str, dict[str, str]] = {}
-    for model in COUNCIL_MODELS:
+    for model in active_members:
         prompt_text, label_map = _build_round_n_prompt(
             model,
             request_payload,
             prior_rounds,
             prior_syntheses=prior_syntheses,
             share_synthesis_with_members=share_synthesis_with_members,
+            council_members=active_members,
         )
         messages_by_model[model] = [{"role": "user", "content": prompt_text}]
         messages_by_model[model].insert(
@@ -615,13 +734,13 @@ async def round_n(
         label_maps[model] = label_map
 
     responses = await query_models_parallel(
-        COUNCIL_MODELS,
+        active_members,
         messages_by_model,
         generation_params=generation_params,
     )
 
     round_responses = []
-    for model in COUNCIL_MODELS:
+    for model in active_members:
         response = responses.get(model)
         if response is None:
             round_responses.append(
@@ -769,11 +888,17 @@ async def run_deliberation(
     counterfactual: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run dynamic deliberation trajectory and persist results."""
+    ensure_runtime_config()
     if rounds < 1:
         raise ValueError("rounds must be >= 1")
+    if not CHAIRMAN_MODEL:
+        raise ValueError("No chairman model configured.")
 
     request_payload = _normalize_deliberation_input(prompt=prompt, deliberation_input=deliberation_input)
     display_prompt = request_payload.get("prompt") or request_payload.get("trial_text") or ""
+    council_members = _resolve_council_members()
+    if not council_members:
+        raise ValueError("No active council members available for deliberation.")
 
     early_stopping_requested = request_payload.get("early_stopping")
     early_stopping_enabled = (
@@ -806,6 +931,8 @@ async def run_deliberation(
         "min_rounds_before_stop": min_rounds_before_stop,
         "synthesis_similarity_threshold": SYNTHESIS_SIMILARITY_THRESHOLD,
         "consensus_ratio_threshold": CONSENSUS_RATIO_THRESHOLD,
+        "active_council_members": council_members,
+        "chairman_model": CHAIRMAN_MODEL,
         "inference_params": {
             "round1": round1_params,
             "round_n": round_n_params,
@@ -825,6 +952,7 @@ async def run_deliberation(
         if round_number == 1:
             current_round = await round_1(
                 request_payload,
+                council_members=council_members,
                 generation_params=round1_params,
             )
         else:
@@ -832,13 +960,14 @@ async def run_deliberation(
                 request_payload,
                 all_rounds,
                 round_number,
+                council_members=council_members,
                 prior_syntheses=round_syntheses,
                 share_synthesis_with_members=share_synthesis_with_members,
                 generation_params=round_n_params,
             )
 
         all_rounds.append(current_round)
-        save_round(
+        await _save_round_async(
             batch_id=resolved_batch_id,
             prompt_id=resolved_prompt_id,
             prompt=display_prompt,
@@ -879,7 +1008,7 @@ async def run_deliberation(
             }
         )
 
-        update_prompt_result(
+        await _update_prompt_result_async(
             batch_id=resolved_batch_id,
             prompt_id=resolved_prompt_id,
             updates={
@@ -910,7 +1039,7 @@ async def run_deliberation(
     actual_rounds = len(all_rounds)
     stopped_early = actual_rounds < rounds
 
-    stored = save_synthesis(
+    stored = await _save_synthesis_async(
         batch_id=resolved_batch_id,
         prompt_id=resolved_prompt_id,
         prompt=display_prompt,
@@ -924,7 +1053,7 @@ async def run_deliberation(
 
     stored["round_syntheses"] = round_syntheses
     evidence_index = build_evidence_index(stored)
-    updated = update_prompt_result(
+    updated = await _update_prompt_result_async(
         batch_id=resolved_batch_id,
         prompt_id=resolved_prompt_id,
         updates={
@@ -947,8 +1076,9 @@ async def run_batch_deliberation(
     items: list[dict[str, Any]] | None = None,
     rounds: int = ROUNDS,
     batch_id: str | None = None,
+    max_concurrency: int | None = None,
 ) -> dict[str, Any]:
-    """Run deliberation sequentially for a batch of prompts/items."""
+    """Run deliberation for a batch of prompts/items with bounded concurrency."""
     has_prompts = bool(prompts)
     has_items = bool(items)
     if has_prompts == has_items:
@@ -965,23 +1095,34 @@ async def run_batch_deliberation(
 
     resolved_batch_id = batch_id or str(uuid4())
     total_prompts = len(normalized_items)
+    resolved_concurrency = max_concurrency
+    if resolved_concurrency is None:
+        resolved_concurrency = BATCH_MAX_CONCURRENCY_DEFAULT
+    resolved_concurrency = max(1, min(int(resolved_concurrency), total_prompts))
+    semaphore = asyncio.Semaphore(resolved_concurrency)
 
-    for index, item in enumerate(normalized_items, start=1):
+    async def run_item(index: int, item: dict[str, Any]) -> None:
         item_rounds = int(item.get("rounds") or rounds)
-        await run_deliberation(
-            rounds=item_rounds,
-            batch_id=resolved_batch_id,
-            prompt_id=f"prompt-{index:04d}-{uuid4().hex[:8]}",
-            prompt_index=index,
-            prompt_count=total_prompts,
-            deliberation_input=item,
-        )
+        async with semaphore:
+            await run_deliberation(
+                rounds=item_rounds,
+                batch_id=resolved_batch_id,
+                prompt_id=f"prompt-{index:04d}-{uuid4().hex[:8]}",
+                prompt_index=index,
+                prompt_count=total_prompts,
+                deliberation_input=item,
+            )
 
-    stored_batch = load_result(resolved_batch_id) or {"batch": None, "results": []}
+    await asyncio.gather(
+        *(run_item(index, item) for index, item in enumerate(normalized_items, start=1))
+    )
+
+    stored_batch = await _load_result_async(resolved_batch_id) or {"batch": None, "results": []}
     return {
         "batch_id": resolved_batch_id,
         "rounds": rounds,
         "prompt_count": total_prompts,
+        "max_concurrency": resolved_concurrency,
         "batch": stored_batch.get("batch"),
         "results": stored_batch.get("results", []),
     }
@@ -997,7 +1138,7 @@ async def run_counterfactual_deliberation(
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run a full counterfactual rerun with selected evidence masked out."""
-    source_result = load_prompt_result(source_batch_id, source_prompt_id)
+    source_result = await _load_prompt_result_async(source_batch_id, source_prompt_id)
     if source_result is None:
         raise ValueError("Source prompt result not found.")
 

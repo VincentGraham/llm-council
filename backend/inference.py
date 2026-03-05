@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import time
 from typing import Any
 
 import httpx
@@ -13,6 +15,18 @@ from .config import COUNCIL_MODELS, MODEL_ENDPOINTS, MODEL_REQUEST_NAMES
 logger = logging.getLogger(__name__)
 _CLIENT_LOCK = asyncio.Lock()
 _SHARED_CLIENT: httpx.AsyncClient | None = None
+_SHARED_CLIENT_CREATED_AT = 0.0
+_SHARED_CLIENT_TTL_SECONDS = float(os.getenv("SHARED_HTTP_CLIENT_TTL_SECONDS", "600"))
+_QUERY_RETRIES = max(0, int(os.getenv("MODEL_QUERY_RETRIES", "2")))
+_QUERY_RETRY_BACKOFF_SECONDS = float(os.getenv("MODEL_QUERY_RETRY_BACKOFF_SECONDS", "0.5"))
+_RESERVED_PAYLOAD_KEYS = {
+    "model",
+    "messages",
+    "temperature",
+    "max_tokens",
+    "top_p",
+    "response_format",
+}
 
 
 def _normalize_model_id(model_id: str) -> str:
@@ -42,23 +56,47 @@ def _build_shared_client() -> httpx.AsyncClient:
 
 
 async def _get_shared_client() -> httpx.AsyncClient:
-    global _SHARED_CLIENT
+    global _SHARED_CLIENT, _SHARED_CLIENT_CREATED_AT
+    now = time.monotonic()
     if _SHARED_CLIENT is not None:
-        return _SHARED_CLIENT
+        age_seconds = now - _SHARED_CLIENT_CREATED_AT
+        if age_seconds <= _SHARED_CLIENT_TTL_SECONDS:
+            return _SHARED_CLIENT
+        async with _CLIENT_LOCK:
+            if _SHARED_CLIENT is not None and (time.monotonic() - _SHARED_CLIENT_CREATED_AT) > _SHARED_CLIENT_TTL_SECONDS:
+                await _SHARED_CLIENT.aclose()
+                _SHARED_CLIENT = None
 
     async with _CLIENT_LOCK:
         if _SHARED_CLIENT is None:
             _SHARED_CLIENT = _build_shared_client()
+            _SHARED_CLIENT_CREATED_AT = time.monotonic()
     return _SHARED_CLIENT
 
 
 async def close_shared_client() -> None:
     """Close the shared async HTTP client."""
-    global _SHARED_CLIENT
+    global _SHARED_CLIENT, _SHARED_CLIENT_CREATED_AT
     async with _CLIENT_LOCK:
         if _SHARED_CLIENT is not None:
             await _SHARED_CLIENT.aclose()
             _SHARED_CLIENT = None
+            _SHARED_CLIENT_CREATED_AT = 0.0
+
+
+def _is_retryable_http_status(status_code: int) -> bool:
+    return status_code in {408, 409, 425, 429} or status_code >= 500
+
+
+def _merge_extra_body(payload: dict[str, Any], extra_body: dict[str, Any] | None) -> dict[str, Any]:
+    if not extra_body:
+        return payload
+    for key, value in extra_body.items():
+        if key in _RESERVED_PAYLOAD_KEYS:
+            logger.warning("Ignoring extra_body override for reserved payload key: %s", key)
+            continue
+        payload[key] = value
+    return payload
 
 
 def _message_content_to_text(content: Any) -> str:
@@ -111,21 +149,59 @@ async def query_model(
         payload["top_p"] = top_p
     if response_format is not None:
         payload["response_format"] = response_format
-    if extra_body:
-        payload.update(extra_body)
+    payload = _merge_extra_body(payload, extra_body)
 
-    try:
-        client = await _get_shared_client()
-        response = await client.post(
-            f"{base_url}/chat/completions",
-            json=payload,
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        data = response.json()
-    except Exception:  # pylint: disable=broad-except
-        logger.exception("Error querying model %s", model)
-        return None
+    for attempt in range(_QUERY_RETRIES + 1):
+        try:
+            client = await _get_shared_client()
+            response = await client.post(
+                f"{base_url}/chat/completions",
+                json=payload,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            data = response.json()
+            break
+        except asyncio.CancelledError:
+            raise
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 0
+            retryable = _is_retryable_http_status(status_code)
+            if retryable and attempt < _QUERY_RETRIES:
+                backoff = _QUERY_RETRY_BACKOFF_SECONDS * (2 ** attempt)
+                logger.warning(
+                    "Retrying model query after HTTP %s for %s (attempt %s/%s, backoff=%.2fs).",
+                    status_code,
+                    model,
+                    attempt + 1,
+                    _QUERY_RETRIES + 1,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
+                continue
+            logger.warning("Model query failed for %s with HTTP %s", model, status_code)
+            return None
+        except (httpx.TimeoutException, httpx.TransportError, httpx.NetworkError) as exc:
+            if attempt < _QUERY_RETRIES:
+                backoff = _QUERY_RETRY_BACKOFF_SECONDS * (2 ** attempt)
+                logger.warning(
+                    "Retrying model query for %s after transport error %s (attempt %s/%s, backoff=%.2fs).",
+                    model,
+                    type(exc).__name__,
+                    attempt + 1,
+                    _QUERY_RETRIES + 1,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
+                continue
+            logger.warning("Transport error querying model %s: %s", model, exc)
+            return None
+        except ValueError:
+            logger.exception("Invalid JSON response while querying model %s", model)
+            return None
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("Unexpected error querying model %s", model)
+            return None
 
     choices = data.get("choices") or []
     if not choices:
@@ -220,7 +296,18 @@ async def health_check(model: str, timeout: float = 10.0) -> dict[str, Any]:
             "available_models": available_models,
             "error": None if healthy else "Configured request_model was not found on endpoint",
         }
-    except Exception as exc:  # pylint: disable=broad-except
+    except asyncio.CancelledError:
+        raise
+    except httpx.HTTPError as exc:
+        logger.warning("Health check failed for model %s: %s", model, exc)
+        return {
+            "model": model,
+            "endpoint": base_url,
+            "endpoint_healthy": False,
+            "healthy": False,
+            "error": str(exc),
+        }
+    except ValueError as exc:
         logger.warning("Health check failed for model %s: %s", model, exc)
         return {
             "model": model,

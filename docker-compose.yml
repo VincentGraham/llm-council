@@ -2,11 +2,20 @@ services:
   llama-3-1-70b-instruct:
     image: nvcr.io/nim/meta/llama-3_1-70b-instruct:latest
     container_name: nim-llama-3-1-70b-instruct
-    runtime: nvidia
     ipc: host
     ulimits:
       memlock: -1
       stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            capabilities:
+            - gpu
+            device_ids:
+            - '0'
+            - '1'
     environment:
     - NGC_API_KEY=${NGC_API_KEY}
     - NVIDIA_VISIBLE_DEVICES=0,1
@@ -30,11 +39,20 @@ services:
   qwen2-5-72b-instruct:
     image: nvcr.io/nim/qwen/qwen2_5-72b-instruct:latest
     container_name: nim-qwen2-5-72b-instruct
-    runtime: nvidia
     ipc: host
     ulimits:
       memlock: -1
       stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            capabilities:
+            - gpu
+            device_ids:
+            - '2'
+            - '3'
     environment:
     - NGC_API_KEY=${NGC_API_KEY}
     - NVIDIA_VISIBLE_DEVICES=2,3
@@ -58,11 +76,20 @@ services:
   mistral-large-instruct:
     image: nvcr.io/nim/mistralai/mistral-large-instruct:latest
     container_name: nim-mistral-large-instruct
-    runtime: nvidia
     ipc: host
     ulimits:
       memlock: -1
       stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            capabilities:
+            - gpu
+            device_ids:
+            - '4'
+            - '5'
     environment:
     - NGC_API_KEY=${NGC_API_KEY}
     - NVIDIA_VISIBLE_DEVICES=4,5
@@ -86,11 +113,20 @@ services:
   nemotron-4-340b-instruct:
     image: nvcr.io/nim/nvidia/nemotron-4-340b-instruct:latest
     container_name: nim-nemotron-4-340b-instruct
-    runtime: nvidia
     ipc: host
     ulimits:
       memlock: -1
       stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            capabilities:
+            - gpu
+            device_ids:
+            - '6'
+            - '7'
     environment:
     - NGC_API_KEY=${NGC_API_KEY}
     - NVIDIA_VISIBLE_DEVICES=6,7

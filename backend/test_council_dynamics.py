@@ -6,6 +6,7 @@ import unittest
 
 from backend.council import (
     _build_round_n_prompt,
+    _prediction_signature,
     _resolve_stage_inference,
     _round_consensus_ratio,
     _summarize_usage,
@@ -26,6 +27,11 @@ class CouncilDynamicsTest(unittest.TestCase):
         ]
         ratio = _round_consensus_ratio(responses)
         self.assertAlmostEqual(ratio, 2 / 3, places=6)
+
+    def test_prediction_signature_includes_probability_with_label(self) -> None:
+        sig_a = _prediction_signature({"label": "success", "probability": 0.9})
+        sig_b = _prediction_signature({"label": "success", "probability": 0.3})
+        self.assertNotEqual(sig_a, sig_b)
 
     def test_synthesis_similarity(self) -> None:
         prev = "The likely duration is about 10 months."
@@ -113,6 +119,34 @@ class CouncilDynamicsTest(unittest.TestCase):
             share_synthesis_with_members=True,
         )
         self.assertIn("Latest chairman synthesis", prompt_shared)
+
+    def test_round_n_labels_remain_stable_when_model_missing(self) -> None:
+        prior_rounds = [
+            {
+                "round": 1,
+                "responses": [
+                    {"model": "m2", "response": "first m2"},
+                    {"model": "m3", "response": "first m3"},
+                ],
+            },
+            {
+                "round": 2,
+                "responses": [
+                    {"model": "m2", "response": ""},
+                    {"model": "m3", "response": "second m3"},
+                ],
+            },
+        ]
+
+        _, latest_map = _build_round_n_prompt(
+            model_name="m1",
+            request_payload={"prompt": "task"},
+            prior_rounds=prior_rounds,
+            prior_syntheses=None,
+            share_synthesis_with_members=False,
+            council_members=["m1", "m2", "m3"],
+        )
+        self.assertEqual(latest_map, {"Response B": "m3"})
 
 
 if __name__ == "__main__":

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import copy
+import os
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -26,6 +30,38 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="LLM Council API", lifespan=lifespan)
+MAX_PROMPT_CHARS = max(1, int(os.getenv("MAX_PROMPT_CHARS", "20000")))
+MAX_TRIAL_TEXT_CHARS = max(1, int(os.getenv("MAX_TRIAL_TEXT_CHARS", "500000")))
+HEALTH_CACHE_TTL_SECONDS = max(0.0, float(os.getenv("HEALTH_CACHE_TTL_SECONDS", "5")))
+_HEALTH_CACHE_LOCK = asyncio.Lock()
+_HEALTH_CACHE: dict[tuple[str, ...], tuple[float, list[dict[str, Any]]]] = {}
+
+
+def _validate_payload_sizes(payload: DeliberationInputRequest) -> None:
+    if payload.prompt and len(payload.prompt) > MAX_PROMPT_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"'prompt' exceeds max length of {MAX_PROMPT_CHARS} characters.",
+        )
+    if payload.trial_text and len(payload.trial_text) > MAX_TRIAL_TEXT_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"'trial_text' exceeds max length of {MAX_TRIAL_TEXT_CHARS} characters.",
+        )
+
+
+async def _cached_health_check(models: list[str]) -> list[dict[str, Any]]:
+    key = tuple(models)
+    now = time.monotonic()
+    async with _HEALTH_CACHE_LOCK:
+        cached = _HEALTH_CACHE.get(key)
+        if cached is not None and (now - cached[0]) <= HEALTH_CACHE_TTL_SECONDS:
+            return copy.deepcopy(cached[1])
+
+    statuses = await health_check_all(models)
+    async with _HEALTH_CACHE_LOCK:
+        _HEALTH_CACHE[key] = (time.monotonic(), statuses)
+    return copy.deepcopy(statuses)
 
 
 class DeliberationInputRequest(BaseModel):
@@ -87,6 +123,7 @@ async def deliberate(request: DeliberateRequest) -> dict[str, Any]:
     """Run N-round deliberation for one prompt and return full stored result."""
     if not (request.prompt and request.prompt.strip()) and not (request.trial_text and request.trial_text.strip()):
         raise HTTPException(status_code=400, detail="Provide at least one of 'prompt' or 'trial_text'.")
+    _validate_payload_sizes(request)
 
     deliberation_input = request.model_dump(exclude_none=True)
 
@@ -113,8 +150,12 @@ async def deliberate_batch(request: BatchRequest) -> dict[str, Any]:
         prompts = [prompt.strip() for prompt in request.prompts if isinstance(prompt, str) and prompt.strip()]
         if not prompts:
             raise HTTPException(status_code=400, detail="prompts must include at least one non-empty item")
+        for prompt in prompts:
+            _validate_payload_sizes(DeliberationInputRequest(prompt=prompt))
     elif request.items:
         items = [item.model_dump(exclude_none=True) for item in request.items]
+        for item in request.items:
+            _validate_payload_sizes(item)
         valid_items = [item for item in items if item.get("prompt") or item.get("trial_text")]
         if not valid_items:
             raise HTTPException(
@@ -153,7 +194,7 @@ async def counterfactual(request: CounterfactualRequest) -> dict[str, Any]:
 @app.get("/api/batch/{batch_id}")
 async def get_batch(batch_id: str) -> dict[str, Any]:
     """Load all prompt results for a stored batch."""
-    result = load_result(batch_id)
+    result = await asyncio.to_thread(load_result, batch_id)
     if result is None:
         raise HTTPException(status_code=404, detail="batch not found")
     return result
@@ -162,7 +203,7 @@ async def get_batch(batch_id: str) -> dict[str, Any]:
 @app.get("/api/evidence/{batch_id}/{prompt_id}")
 async def get_evidence(batch_id: str, prompt_id: str) -> dict[str, Any]:
     """Return flattened evidence index for one stored prompt result."""
-    result = load_prompt_result(batch_id, prompt_id)
+    result = await asyncio.to_thread(load_prompt_result, batch_id, prompt_id)
     if result is None:
         raise HTTPException(status_code=404, detail="prompt result not found")
 
@@ -178,7 +219,7 @@ async def get_evidence(batch_id: str, prompt_id: str) -> dict[str, Any]:
 @app.get("/api/models")
 async def get_models() -> dict[str, Any]:
     """Return configured models with live health checks."""
-    statuses = await health_check_all(COUNCIL_MODELS)
+    statuses = await _cached_health_check(COUNCIL_MODELS)
     return {
         "models": statuses,
         "chairman": CHAIRMAN_MODEL,
@@ -189,8 +230,8 @@ async def get_models() -> dict[str, Any]:
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     """Return overall system readiness based on model endpoint health."""
-    statuses = await health_check_all(COUNCIL_MODELS)
-    all_healthy = all(status.get("healthy") for status in statuses)
+    statuses = await _cached_health_check(COUNCIL_MODELS)
+    all_healthy = bool(statuses) and all(status.get("healthy") for status in statuses)
     return {
         "ready": all_healthy,
         "model_count": len(statuses),

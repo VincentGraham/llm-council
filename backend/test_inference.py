@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from backend.inference import _match_requested_model
+from backend.inference import _match_requested_model, _merge_extra_body
 
 
 class InferenceHelpersTest(unittest.TestCase):
@@ -36,6 +36,20 @@ class InferenceHelpersTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIsNone(matched)
         self.assertEqual(match_type, "missing")
+
+    def test_merge_extra_body_ignores_reserved_keys(self) -> None:
+        payload = {"model": "m1", "messages": [{"role": "user", "content": "hello"}]}
+        merged = _merge_extra_body(
+            payload,
+            {
+                "model": "evil-model",
+                "messages": [],
+                "seed": 7,
+            },
+        )
+        self.assertEqual(merged["model"], "m1")
+        self.assertEqual(merged["messages"], [{"role": "user", "content": "hello"}])
+        self.assertEqual(merged["seed"], 7)
 
 
 if __name__ == "__main__":

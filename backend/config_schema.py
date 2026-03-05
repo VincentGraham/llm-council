@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
 class ModelConfig(BaseModel):
@@ -16,10 +17,28 @@ class ModelConfig(BaseModel):
     name: str
     image: str
     gpus: str
-    port: int
+    port: int = Field(ge=1, le=65535)
     request_model: str | None = None
     endpoint: str | None = None
     chairman: bool = False
+
+    @field_validator("gpus")
+    @classmethod
+    def validate_gpus(cls, value: str) -> str:
+        normalized = value.strip()
+        if not re.fullmatch(r"\d+(?:\s*,\s*\d+)*", normalized):
+            raise ValueError("'gpus' must be a comma-separated list of GPU indices (e.g. '0,1').")
+        return ",".join(part.strip() for part in normalized.split(","))
+
+    @field_validator("image")
+    @classmethod
+    def validate_image(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("'image' cannot be empty.")
+        if " " in normalized or ":" not in normalized:
+            raise ValueError("'image' must be a Docker image reference including a tag.")
+        return normalized
 
 
 class DeliberationConfig(BaseModel):

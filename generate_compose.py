@@ -63,20 +63,36 @@ def build_compose(config: dict[str, Any]) -> dict[str, Any]:
 
     for model in models:
         model_name = str(model["name"])
-        service_name = slugify_service_name(model_name)
+        base_service_name = slugify_service_name(model_name)
+        service_name = base_service_name
+        suffix = 2
         while service_name in used_service_names:
-            service_name = f"{service_name}-x"
+            service_name = f"{base_service_name}-{suffix}"
+            suffix += 1
         used_service_names.add(service_name)
 
         port = int(model["port"])
         gpus = str(model["gpus"])
+        gpu_ids = [gpu.strip() for gpu in gpus.split(",") if gpu.strip()]
 
         services[service_name] = {
             "image": str(model["image"]),
             "container_name": f"nim-{service_name}",
-            "runtime": "nvidia",
             "ipc": "host",
             "ulimits": {"memlock": -1, "stack": 67108864},
+            "deploy": {
+                "resources": {
+                    "reservations": {
+                        "devices": [
+                            {
+                                "driver": "nvidia",
+                                "capabilities": ["gpu"],
+                                "device_ids": gpu_ids,
+                            }
+                        ]
+                    }
+                }
+            },
             "environment": [
                 "NGC_API_KEY=${NGC_API_KEY}",
                 f"NVIDIA_VISIBLE_DEVICES={gpus}",
