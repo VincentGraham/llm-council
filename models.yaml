@@ -39,9 +39,9 @@ models:
     gpus: "4,5"
     port: 8013
     chairman: false
-  - name: llama-3.3-nemotron-super-49b-v1-b
-    request_model: nvidia/llama-3.3-nemotron-super-49b-v1
-    image: nvcr.io/nim/nvidia/llama-3_3-nemotron-super-49b-v1:latest
+  - name: nemotron-3-nano
+    request_model: nvidia/nemotron-3-nano
+    image: nvcr.io/nim/nvidia/nemotron-3-nano:latest
     gpus: "6,7"
     port: 8014
     chairman: false
