@@ -15,6 +15,25 @@ _CLIENT_LOCK = asyncio.Lock()
 _SHARED_CLIENT: httpx.AsyncClient | None = None
 
 
+def _normalize_model_id(model_id: str) -> str:
+    return "".join(char for char in model_id.lower() if char.isalnum())
+
+
+def _match_requested_model(
+    requested_model: str,
+    available_models: list[str],
+) -> tuple[bool, str | None, str]:
+    if requested_model in available_models:
+        return True, requested_model, "exact"
+
+    requested_norm = _normalize_model_id(requested_model)
+    for available in available_models:
+        if _normalize_model_id(available) == requested_norm:
+            return True, available, "normalized"
+
+    return False, None, "missing"
+
+
 def _build_shared_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
         limits=httpx.Limits(max_connections=128, max_keepalive_connections=64),
@@ -161,6 +180,7 @@ async def health_check(model: str, timeout: float = 10.0) -> dict[str, Any]:
         return {
             "model": model,
             "endpoint": None,
+            "endpoint_healthy": False,
             "healthy": False,
             "error": "Model endpoint not configured",
         }
@@ -170,22 +190,42 @@ async def health_check(model: str, timeout: float = 10.0) -> dict[str, Any]:
         response = await client.get(f"{base_url}/models", timeout=timeout)
         response.raise_for_status()
         data = response.json()
-        models = [
+        available_models = [
             item.get("id")
             for item in (data.get("data") or [])
             if isinstance(item, dict) and item.get("id")
         ]
+        request_model = MODEL_REQUEST_NAMES.get(model, model)
+        request_model_available, matched_model_id, match_type = _match_requested_model(
+            request_model,
+            available_models,
+        )
+        healthy = bool(request_model_available)
+        if not request_model_available:
+            logger.warning(
+                "Health check model mismatch for %s: request_model=%s, available=%s",
+                model,
+                request_model,
+                available_models,
+            )
         return {
             "model": model,
             "endpoint": base_url,
-            "healthy": True,
-            "available_models": models,
+            "endpoint_healthy": True,
+            "healthy": healthy,
+            "request_model": request_model,
+            "request_model_available": request_model_available,
+            "request_model_match_type": match_type,
+            "matched_model_id": matched_model_id,
+            "available_models": available_models,
+            "error": None if healthy else "Configured request_model was not found on endpoint",
         }
     except Exception as exc:  # pylint: disable=broad-except
         logger.warning("Health check failed for model %s: %s", model, exc)
         return {
             "model": model,
             "endpoint": base_url,
+            "endpoint_healthy": False,
             "healthy": False,
             "error": str(exc),
         }

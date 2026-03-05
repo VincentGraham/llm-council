@@ -101,6 +101,7 @@ def _normalize_request(request_payload: dict[str, Any] | None, prompt: str) -> d
     payload.setdefault("allow_fuzzy_quotes", False)
     payload.setdefault("early_stopping", None)
     payload.setdefault("min_rounds_before_stop", None)
+    payload.setdefault("share_synthesis_with_members", None)
     payload.setdefault("inference", None)
     payload.setdefault("metadata", None)
     return payload

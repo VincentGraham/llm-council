@@ -11,6 +11,8 @@ from typing import Any
 
 import yaml
 
+from backend.config_schema import load_council_config
+
 
 DEFAULT_CONFIG_PATH = Path("models.yaml")
 DEFAULT_OUTPUT_PATH = Path("docker-compose.yml")
@@ -24,28 +26,8 @@ def slugify_service_name(name: str) -> str:
 
 def load_config(path: Path) -> dict[str, Any]:
     """Load and validate models yaml config."""
-    if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {path}")
-
-    with path.open("r", encoding="utf-8") as handle:
-        data = yaml.safe_load(handle) or {}
-
-    if not isinstance(data, dict):
-        raise ValueError("models.yaml must be a mapping.")
-
-    models = data.get("models")
-    if not isinstance(models, list) or not models:
-        raise ValueError("models.yaml must define a non-empty 'models' list.")
-
-    required_fields = {"name", "image", "gpus", "port"}
-    for index, model in enumerate(models):
-        if not isinstance(model, dict):
-            raise ValueError(f"models[{index}] must be a mapping.")
-        missing = required_fields - model.keys()
-        if missing:
-            raise ValueError(f"models[{index}] missing fields: {sorted(missing)}")
-
-    return data
+    validated = load_council_config(path)
+    return validated.model_dump()
 
 
 def warn_gpu_overlap(models: list[dict[str, Any]]) -> None:

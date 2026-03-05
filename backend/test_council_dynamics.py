@@ -5,6 +5,7 @@ from __future__ import annotations
 import unittest
 
 from backend.council import (
+    _build_round_n_prompt,
     _resolve_stage_inference,
     _round_consensus_ratio,
     _summarize_usage,
@@ -83,6 +84,35 @@ class CouncilDynamicsTest(unittest.TestCase):
         self.assertEqual(summary["calls_with_usage"], 3)
         self.assertEqual(summary["totals"]["prompt_tokens"], 23)
         self.assertEqual(summary["totals"]["completion_tokens"], 17)
+
+    def test_invalid_inference_overrides_log_warning(self) -> None:
+        payload = {"inference": {"round1": {"temperature": "not-a-number", "max_tokens": -5, "foo": 1}}}
+        with self.assertLogs("backend.council", level="WARNING") as logs:
+            resolved = _resolve_stage_inference(payload, "round1", ROUND1_INFERENCE_PARAMS)
+        self.assertEqual(resolved, ROUND1_INFERENCE_PARAMS)
+        self.assertTrue(any("Ignoring" in line for line in logs.output))
+
+    def test_share_synthesis_with_members_toggle(self) -> None:
+        prior_rounds = [{"round": 1, "responses": [{"model": "m2", "response": "response text"}]}]
+        prior_syntheses = [{"synthesis": {"response": "synthesis text"}}]
+
+        prompt_hidden, _ = _build_round_n_prompt(
+            model_name="m1",
+            request_payload={"prompt": "task"},
+            prior_rounds=prior_rounds,
+            prior_syntheses=prior_syntheses,
+            share_synthesis_with_members=False,
+        )
+        self.assertNotIn("Latest chairman synthesis", prompt_hidden)
+
+        prompt_shared, _ = _build_round_n_prompt(
+            model_name="m1",
+            request_payload={"prompt": "task"},
+            prior_rounds=prior_rounds,
+            prior_syntheses=prior_syntheses,
+            share_synthesis_with_members=True,
+        )
+        self.assertIn("Latest chairman synthesis", prompt_shared)
 
 
 if __name__ == "__main__":

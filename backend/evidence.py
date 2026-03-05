@@ -187,6 +187,8 @@ def _find_fuzzy_span(quote: str, source_text: str) -> tuple[int, int] | None:
         return None
 
     best: tuple[float, int, int] | None = None
+    matcher = SequenceMatcher(None, quote_norm, "")
+    minimum_viable_quick = 0.5
 
     source_len = len(source_text)
     for window_len in _window_lengths(len(quote.strip()), source_len):
@@ -197,7 +199,14 @@ def _find_fuzzy_span(quote: str, source_text: str) -> tuple[int, int] | None:
             if not candidate_norm:
                 continue
 
-            score = SequenceMatcher(None, quote_norm, candidate_norm).ratio()
+            matcher.set_seq2(candidate_norm)
+            quick_score = matcher.quick_ratio()
+            if quick_score < minimum_viable_quick:
+                continue
+            if best is not None and quick_score <= best[0]:
+                continue
+
+            score = matcher.ratio()
             if best is None or score > best[0]:
                 best = (score, start, end)
                 if score >= 0.995:

@@ -2,6 +2,7 @@ rounds: 3
 extractor_model: qwen2.5-72b-instruct
 deliberation:
   observer_chairman: true
+  share_synthesis_with_members: false
   early_stopping: true
   min_rounds_before_stop: 2
   synthesis_similarity_threshold: 0.985

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -19,6 +20,7 @@ from .config import (
     ROUND_N_INFERENCE_PARAMS,
     OBSERVER_CHAIRMAN_MODE,
     ROUNDS,
+    SHARE_SYNTHESIS_WITH_MEMBERS,
     SYNTHESIS_INFERENCE_PARAMS,
     SYNTHESIS_SIMILARITY_THRESHOLD,
 )
@@ -36,6 +38,8 @@ from .storage import (
     save_synthesis,
     update_prompt_result,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> str:
@@ -74,6 +78,7 @@ def _normalize_deliberation_input(
         "metadata": source.get("metadata"),
         "early_stopping": source.get("early_stopping"),
         "min_rounds_before_stop": source.get("min_rounds_before_stop"),
+        "share_synthesis_with_members": source.get("share_synthesis_with_members"),
         "inference": inference,
     }
 
@@ -150,8 +155,15 @@ def _normalize_usage(usage: Any) -> dict[str, int] | None:
     return normalized or None
 
 
-def _sanitize_generation_params(params: Any) -> dict[str, Any]:
+def _sanitize_generation_params(stage_name: str, params: Any) -> dict[str, Any]:
+    if params is None:
+        return {}
     if not isinstance(params, dict):
+        logger.warning(
+            "Ignoring inference override for stage '%s': expected object, got %s",
+            stage_name,
+            type(params).__name__,
+        )
         return {}
 
     sanitized: dict[str, Any] = {}
@@ -160,22 +172,60 @@ def _sanitize_generation_params(params: Any) -> dict[str, Any]:
             temperature = float(params["temperature"])
             if 0.0 <= temperature <= 2.0:
                 sanitized["temperature"] = temperature
+            else:
+                logger.warning(
+                    "Ignoring invalid temperature override for stage '%s': %r",
+                    stage_name,
+                    params["temperature"],
+                )
         except (TypeError, ValueError):
-            pass
+            logger.warning(
+                "Ignoring non-numeric temperature override for stage '%s': %r",
+                stage_name,
+                params["temperature"],
+            )
     if params.get("max_tokens") is not None:
         try:
             value = int(params["max_tokens"])
             if value > 0:
                 sanitized["max_tokens"] = value
+            else:
+                logger.warning(
+                    "Ignoring invalid max_tokens override for stage '%s': %r",
+                    stage_name,
+                    params["max_tokens"],
+                )
         except (TypeError, ValueError):
-            pass
+            logger.warning(
+                "Ignoring non-integer max_tokens override for stage '%s': %r",
+                stage_name,
+                params["max_tokens"],
+            )
     if params.get("top_p") is not None:
         try:
             top_p = float(params["top_p"])
             if 0.0 < top_p <= 1.0:
                 sanitized["top_p"] = top_p
+            else:
+                logger.warning(
+                    "Ignoring invalid top_p override for stage '%s': %r",
+                    stage_name,
+                    params["top_p"],
+                )
         except (TypeError, ValueError):
-            pass
+            logger.warning(
+                "Ignoring non-numeric top_p override for stage '%s': %r",
+                stage_name,
+                params["top_p"],
+            )
+
+    for key in params:
+        if key not in {"temperature", "max_tokens", "top_p"}:
+            logger.warning(
+                "Ignoring unknown inference key for stage '%s': %s",
+                stage_name,
+                key,
+            )
     return sanitized
 
 
@@ -192,8 +242,19 @@ def _resolve_stage_inference(
     stage_overrides = request_inference.get(stage_name)
     if stage_overrides is None and stage_name == "round_n":
         stage_overrides = request_inference.get("roundn")
-    resolved.update(_sanitize_generation_params(stage_overrides))
+    resolved.update(_sanitize_generation_params(stage_name, stage_overrides))
     return resolved
+
+
+def _warn_unknown_inference_stages(request_payload: dict[str, Any]) -> None:
+    request_inference = request_payload.get("inference")
+    if not isinstance(request_inference, dict):
+        return
+
+    known = {"round1", "round_n", "roundn", "synthesis", "extractor"}
+    for stage_name in request_inference:
+        if stage_name not in known:
+            logger.warning("Ignoring unknown inference stage override: %s", stage_name)
 
 
 def _summarize_usage(
@@ -465,7 +526,7 @@ def _build_round_n_prompt(
     request_payload: dict[str, Any],
     prior_rounds: list[dict[str, Any]],
     prior_syntheses: list[dict[str, Any]] | None,
-    observer_chairman: bool,
+    share_synthesis_with_members: bool,
 ) -> tuple[str, dict[str, str]]:
     prior_sections = []
 
@@ -490,7 +551,7 @@ def _build_round_n_prompt(
     )
 
     chairman_context = ""
-    if not observer_chairman and prior_syntheses:
+    if share_synthesis_with_members and prior_syntheses:
         latest_synthesis = prior_syntheses[-1].get("synthesis", {}).get("response", "")
         if latest_synthesis:
             chairman_context = f"\n\nLatest chairman synthesis (for reference):\n{latest_synthesis}"
@@ -527,7 +588,7 @@ async def round_n(
     prior_rounds: list[dict[str, Any]],
     n: int,
     prior_syntheses: list[dict[str, Any]] | None = None,
-    observer_chairman: bool = True,
+    share_synthesis_with_members: bool = False,
     generation_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Round n: each model critiques/refines using prior rounds from other models."""
@@ -544,7 +605,7 @@ async def round_n(
             request_payload,
             prior_rounds,
             prior_syntheses=prior_syntheses,
-            observer_chairman=observer_chairman,
+            share_synthesis_with_members=share_synthesis_with_members,
         )
         messages_by_model[model] = [{"role": "user", "content": prompt_text}]
         messages_by_model[model].insert(
@@ -626,14 +687,10 @@ async def synthesize(
     """Chairman synthesizes current council state."""
     rounds_text_parts = []
     for round_data in all_rounds:
-        response_lines = []
-        for response in round_data["responses"]:
-            response_lines.append(
-                f"Model: {response.get('model')}\nResponse:\n{response.get('response', '')}"
-            )
+        response_lines, _ = _format_responses_with_labels(round_data["responses"])
         rounds_text_parts.append(
-            f"ROUND {round_data['round']} ({round_data.get('type', 'deliberation')}):\n\n"
-            + "\n\n".join(response_lines)
+            f"ROUND {round_data['round']} ({round_data.get('type', 'deliberation')}, anonymized):\n\n"
+            + ("\n\n".join(response_lines) if response_lines else "No responses available.")
         )
 
     rounds_text = "\n\n".join(rounds_text_parts)
@@ -722,6 +779,12 @@ async def run_deliberation(
     early_stopping_enabled = (
         EARLY_STOP_ENABLED_DEFAULT if early_stopping_requested is None else bool(early_stopping_requested)
     )
+    share_synthesis_requested = request_payload.get("share_synthesis_with_members")
+    share_synthesis_with_members = (
+        SHARE_SYNTHESIS_WITH_MEMBERS
+        if share_synthesis_requested is None
+        else bool(share_synthesis_requested)
+    )
 
     min_rounds_before_stop = request_payload.get("min_rounds_before_stop")
     if min_rounds_before_stop is None:
@@ -731,12 +794,14 @@ async def run_deliberation(
     except (TypeError, ValueError) as exc:
         raise ValueError("min_rounds_before_stop must be an integer >= 1") from exc
 
+    _warn_unknown_inference_stages(request_payload)
     round1_params = _resolve_stage_inference(request_payload, "round1", ROUND1_INFERENCE_PARAMS)
     round_n_params = _resolve_stage_inference(request_payload, "round_n", ROUND_N_INFERENCE_PARAMS)
     synthesis_params = _resolve_stage_inference(request_payload, "synthesis", SYNTHESIS_INFERENCE_PARAMS)
 
     deliberation_meta = {
         "observer_chairman": OBSERVER_CHAIRMAN_MODE,
+        "share_synthesis_with_members": share_synthesis_with_members,
         "early_stopping_enabled": early_stopping_enabled,
         "min_rounds_before_stop": min_rounds_before_stop,
         "synthesis_similarity_threshold": SYNTHESIS_SIMILARITY_THRESHOLD,
@@ -768,7 +833,7 @@ async def run_deliberation(
                 all_rounds,
                 round_number,
                 prior_syntheses=round_syntheses,
-                observer_chairman=OBSERVER_CHAIRMAN_MODE,
+                share_synthesis_with_members=share_synthesis_with_members,
                 generation_params=round_n_params,
             )
 
@@ -964,6 +1029,7 @@ async def run_counterfactual_deliberation(
         "metadata": metadata or source_request.get("metadata"),
         "early_stopping": source_request.get("early_stopping"),
         "min_rounds_before_stop": source_request.get("min_rounds_before_stop"),
+        "share_synthesis_with_members": source_request.get("share_synthesis_with_members"),
         "inference": source_request.get("inference"),
     }
     if counterfactual_request.get("trial_text"):

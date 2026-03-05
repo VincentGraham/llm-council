@@ -39,6 +39,8 @@ Set:
 - request model IDs (`request_model`, optional)
 - extractor model (`extractor_model`, optional, defaults to chairman)
 - deliberation controls (`deliberation.*`) for observer mode + early stopping
+  - `observer_chairman`: chairman synthesis trajectory is tracked each round
+  - `share_synthesis_with_members`: whether that synthesis is shown to members in later rounds
 - stage-specific inference controls (`inference.round1`, `inference.round_n`, `inference.synthesis`, `inference.extractor`)
 - NIM images
 - GPU assignments
@@ -52,6 +54,7 @@ python generate_compose.py
 ```
 
 This writes `docker-compose.yml` from `models.yaml`.
+Compose generation uses the same Pydantic schema validation as the backend loader.
 
 ## Run
 
@@ -64,7 +67,7 @@ uv sync
 
 1. runs `docker compose up -d`
 2. starts FastAPI on `http://localhost:8001`
-3. waits until `/api/health` reports model readiness
+3. waits until `/api/health` reports model readiness (including configured `request_model` availability)
 
 ## API Endpoints
 
@@ -87,6 +90,7 @@ uv sync
   "allow_fuzzy_quotes": false,
   "early_stopping": true,
   "min_rounds_before_stop": 2,
+  "share_synthesis_with_members": false,
   "inference": {
     "round1": {"temperature": 0.7, "max_tokens": 2200},
     "round_n": {"temperature": 0.5, "max_tokens": 2200},
@@ -170,6 +174,9 @@ Per response includes:
 - `structured_parse_errors`
 - `response` (narrative text)
 - `usage` (token usage if returned by model endpoint)
+
+`/api/health` and `/api/models` now verify that each endpoint exposes the configured `request_model`.
+Readiness only becomes `true` when both endpoint connectivity and request-model resolution pass.
 
 ## Verification
 

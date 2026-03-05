@@ -38,6 +38,7 @@ class DeliberationInputRequest(BaseModel):
     allow_fuzzy_quotes: bool = False
     early_stopping: bool | None = None
     min_rounds_before_stop: int | None = Field(default=None, ge=1)
+    share_synthesis_with_members: bool | None = None
     inference: dict[str, dict[str, float | int | None]] | None = None
     metadata: dict[str, Any] | None = None
 
