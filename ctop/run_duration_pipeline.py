@@ -33,6 +33,7 @@ DEFAULT_OUTPUT_ROOT = Path("/data/trials/output")
 DEFAULT_EPSILON_MONTHS = 1.0
 DEFAULT_EMA_ALPHA = 0.12
 DEFAULT_SHORT_THRESHOLD_MONTHS = 12.0
+DEFAULT_CHECKPOINT_EVERY_TRIALS = 5
 
 SEMANTIC_TEXT_FIELDS = [
     ("Brief title", "brief_title"),
@@ -886,14 +887,15 @@ def _write_dataframes(
     long_df: pd.DataFrame,
     wide_df: pd.DataFrame,
     output_dir: Path,
+    suffix: str = "",
 ) -> dict[str, Path]:
     paths = {
-        "long_csv": output_dir / "duration_predictions_long.csv",
-        "long_parquet": output_dir / "duration_predictions_long.parquet",
-        "long_pkl": output_dir / "duration_predictions_long.pkl",
-        "wide_csv": output_dir / "duration_predictions_wide.csv",
-        "wide_parquet": output_dir / "duration_predictions_wide.parquet",
-        "wide_pkl": output_dir / "duration_predictions_wide.pkl",
+        "long_csv": output_dir / f"duration_predictions_long{suffix}.csv",
+        "long_parquet": output_dir / f"duration_predictions_long{suffix}.parquet",
+        "long_pkl": output_dir / f"duration_predictions_long{suffix}.pkl",
+        "wide_csv": output_dir / f"duration_predictions_wide{suffix}.csv",
+        "wide_parquet": output_dir / f"duration_predictions_wide{suffix}.parquet",
+        "wide_pkl": output_dir / f"duration_predictions_wide{suffix}.pkl",
     }
 
     long_df.to_csv(paths["long_csv"], index=False)
@@ -910,6 +912,39 @@ def _write_dataframes(
         ) from exc
 
     return paths
+
+
+def _write_checkpoint_snapshot(
+    *,
+    run_id: str,
+    output_dir: Path,
+    trial_index: int,
+    total_trials: int,
+    rows_snapshot: list[dict[str, Any]],
+    metrics_snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist rolling checkpoint artifacts for crash recovery."""
+    long_df = pd.DataFrame(rows_snapshot, columns=LONG_OUTPUT_COLUMNS)
+    wide_df = _build_wide_predictions_df(long_df)
+    checkpoint_paths = _write_dataframes(
+        long_df=long_df,
+        wide_df=wide_df,
+        output_dir=output_dir,
+        suffix=".checkpoint",
+    )
+    payload = {
+        "run_id": run_id,
+        "checkpoint_at_trial": trial_index,
+        "total_trials": total_trials,
+        "long_rows": len(long_df),
+        "wide_rows": len(wide_df),
+        "evaluation_metrics": metrics_snapshot,
+        "output_files": {key: str(path) for key, path in checkpoint_paths.items()},
+        "updated_at": _utcnow(),
+    }
+    manifest_path = output_dir / "run_manifest.checkpoint.json"
+    manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
 
 
 def _build_manifest(
@@ -976,6 +1011,8 @@ async def run_duration_pipeline(
     ema_alpha: float = DEFAULT_EMA_ALPHA,
     short_threshold_months: float = DEFAULT_SHORT_THRESHOLD_MONTHS,
     show_progress: bool = True,
+    checkpoint_every_trials: int = DEFAULT_CHECKPOINT_EVERY_TRIALS,
+    checkpoint_callback: Callable[[int, list[dict[str, Any]], dict[str, Any]], None] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     metrics = OnlineTrialMetrics(
@@ -1054,6 +1091,13 @@ async def run_duration_pipeline(
                 metrics=metrics,
                 units=0,
             )
+
+            if (
+                checkpoint_callback is not None
+                and checkpoint_every_trials > 0
+                and trial_index % checkpoint_every_trials == 0
+            ):
+                checkpoint_callback(trial_index, list(rows), metrics.summary())
     finally:
         progress.close()
 
@@ -1068,6 +1112,7 @@ async def execute_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     output_root = Path(args.output_root)
     run_id = args.run_id or uuid4().hex[:8]
     rounds = int(args.rounds) if args.rounds is not None else ROUNDS
+    checkpoint_every_trials = int(args.checkpoint_every_trials)
     strict = bool(args.strict)
 
     if args.max_trials is not None and int(args.max_trials) <= 0:
@@ -1078,6 +1123,8 @@ async def execute_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--ema-alpha must be in the interval (0, 1].")
     if float(args.short_threshold_months) <= 0:
         raise ValueError("--short-threshold-months must be > 0.")
+    if checkpoint_every_trials < 0:
+        raise ValueError("--checkpoint-every-trials must be >= 0.")
 
     _ensure_writable_dir(output_root, strict=strict)
     run_output_dir = output_root / run_id
@@ -1087,6 +1134,27 @@ async def execute_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     trial_count_input = len(input_df)
     if args.max_trials is not None:
         input_df = input_df.head(int(args.max_trials))
+
+    total_trials = len(input_df)
+
+    def checkpoint_callback(
+        trial_index: int,
+        rows_snapshot: list[dict[str, Any]],
+        metrics_snapshot: dict[str, Any],
+    ) -> None:
+        if checkpoint_every_trials <= 0:
+            return
+        try:
+            _write_checkpoint_snapshot(
+                run_id=run_id,
+                output_dir=run_output_dir,
+                trial_index=trial_index,
+                total_trials=total_trials,
+                rows_snapshot=rows_snapshot,
+                metrics_snapshot=metrics_snapshot,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Checkpoint write failed at trial %s: %s", trial_index, exc)
 
     long_df, wide_df, evaluation_metrics = await run_duration_pipeline(
         input_df=input_df,
@@ -1099,6 +1167,8 @@ async def execute_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         ema_alpha=float(args.ema_alpha),
         short_threshold_months=float(args.short_threshold_months),
         show_progress=bool(args.progress),
+        checkpoint_every_trials=checkpoint_every_trials,
+        checkpoint_callback=checkpoint_callback if checkpoint_every_trials > 0 else None,
     )
 
     output_paths = _write_dataframes(
@@ -1212,6 +1282,15 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Show two-line tqdm progress display (default: true).",
+    )
+    parser.add_argument(
+        "--checkpoint-every-trials",
+        type=int,
+        default=DEFAULT_CHECKPOINT_EVERY_TRIALS,
+        help=(
+            "Write rolling checkpoint artifacts every N trials (default: "
+            f"{DEFAULT_CHECKPOINT_EVERY_TRIALS}, use 0 to disable)."
+        ),
     )
     parser.add_argument(
         "--strict",

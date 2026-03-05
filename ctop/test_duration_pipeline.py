@@ -278,6 +278,7 @@ class DurationPipelineTest(unittest.IsolatedAsyncioTestCase):
                 ema_alpha=0.12,
                 short_threshold_months=12.0,
                 progress=False,
+                checkpoint_every_trials=1,
                 strict=True,
             )
 
@@ -311,6 +312,18 @@ class DurationPipelineTest(unittest.IsolatedAsyncioTestCase):
             for name in expected_files:
                 self.assertTrue((run_dir / name).exists(), msg=f"missing output file {name}")
 
+            checkpoint_files = [
+                "duration_predictions_long.checkpoint.csv",
+                "duration_predictions_long.checkpoint.parquet",
+                "duration_predictions_long.checkpoint.pkl",
+                "duration_predictions_wide.checkpoint.csv",
+                "duration_predictions_wide.checkpoint.parquet",
+                "duration_predictions_wide.checkpoint.pkl",
+                "run_manifest.checkpoint.json",
+            ]
+            for name in checkpoint_files:
+                self.assertTrue((run_dir / name).exists(), msg=f"missing checkpoint file {name}")
+
             manifest_path = run_dir / "run_manifest.json"
             persisted_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest["run_id"], "abcd1234")
@@ -321,6 +334,30 @@ class DurationPipelineTest(unittest.IsolatedAsyncioTestCase):
     def test_build_wide_predictions_df_empty(self) -> None:
         wide_df = _build_wide_predictions_df(pd.DataFrame(columns=LONG_OUTPUT_COLUMNS))
         self.assertEqual(len(wide_df), 0)
+
+    async def test_run_duration_pipeline_checkpoint_callback(self) -> None:
+        input_df = _input_dataframe()
+        snapshots: list[tuple[int, int]] = []
+
+        with patch(
+            "ctop.run_duration_pipeline.run_deliberation",
+            new=AsyncMock(return_value=_baseline_result(evidence_count=0)),
+        ):
+            await run_duration_pipeline(
+                input_df=input_df,
+                run_id="run12345",
+                prediction_target="duration",
+                rounds=3,
+                counterfactual_enabled=False,
+                allow_fuzzy_quotes=False,
+                show_progress=False,
+                checkpoint_every_trials=1,
+                checkpoint_callback=lambda trial_index, rows_snapshot, _metrics: snapshots.append(
+                    (trial_index, len(rows_snapshot))
+                ),
+            )
+
+        self.assertEqual(snapshots, [(1, 1)])
 
 
 if __name__ == "__main__":

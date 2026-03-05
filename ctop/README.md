@@ -26,6 +26,12 @@ uv run python -m ctop.run_duration_pipeline \
   --output-root "/data/trials/output"
 ```
 
+By default, rolling checkpoints are written every 5 trials to protect long runs from crashes.
+Disable or change cadence with:
+
+- `--checkpoint-every-trials 0` (disable)
+- `--checkpoint-every-trials 1` (save every trial)
+
 Default runtime UI uses a two-line progress display:
 
 - line 1: tqdm progress bar with live metrics (`ema@1m`, `hit@1m`, `mae`, `rmse`, `f1@12m`)
