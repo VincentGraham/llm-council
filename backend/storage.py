@@ -18,7 +18,7 @@ except ImportError:  # pragma: no cover
     fcntl = None
 
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 def _utcnow() -> str:
@@ -101,13 +101,14 @@ def _normalize_request(request_payload: dict[str, Any] | None, prompt: str) -> d
     payload.setdefault("allow_fuzzy_quotes", False)
     payload.setdefault("early_stopping", None)
     payload.setdefault("min_rounds_before_stop", None)
+    payload.setdefault("inference", None)
     payload.setdefault("metadata", None)
     return payload
 
 
 def _normalize_result_payload(payload: dict[str, Any]) -> dict[str, Any]:
     prompt = payload.get("prompt", "")
-    payload.setdefault("schema_version", 1)
+    payload.setdefault("schema_version", CURRENT_SCHEMA_VERSION)
     payload.setdefault("request", _normalize_request(None, prompt))
     payload.setdefault("evidence_index", [])
     payload.setdefault("counterfactual", None)
@@ -119,6 +120,14 @@ def _normalize_result_payload(payload: dict[str, Any]) -> dict[str, Any]:
     payload.setdefault("stopped_early", False)
     payload.setdefault("early_stop_reason", None)
     payload.setdefault("deliberation_meta", None)
+    payload.setdefault(
+        "usage_summary",
+        {
+            "calls_with_usage": 0,
+            "totals": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "by_model": {},
+        },
+    )
     payload.setdefault("created_at", _utcnow())
     payload.setdefault("updated_at", payload["created_at"])
     return payload
@@ -226,6 +235,11 @@ def _load_or_create_prompt_result(
         "stopped_early": False,
         "early_stop_reason": None,
         "deliberation_meta": None,
+        "usage_summary": {
+            "calls_with_usage": 0,
+            "totals": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "by_model": {},
+        },
     }
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -14,11 +15,17 @@ from .council import (
     run_deliberation,
 )
 from .evidence import build_evidence_index
-from .inference import health_check_all
+from .inference import close_shared_client, health_check_all
 from .storage import load_prompt_result, load_result
 
 
-app = FastAPI(title="LLM Council API")
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    yield
+    await close_shared_client()
+
+
+app = FastAPI(title="LLM Council API", lifespan=lifespan)
 
 
 class DeliberationInputRequest(BaseModel):
@@ -31,6 +38,7 @@ class DeliberationInputRequest(BaseModel):
     allow_fuzzy_quotes: bool = False
     early_stopping: bool | None = None
     min_rounds_before_stop: int | None = Field(default=None, ge=1)
+    inference: dict[str, dict[str, float | int | None]] | None = None
     metadata: dict[str, Any] | None = None
 
 

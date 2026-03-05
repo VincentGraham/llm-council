@@ -64,6 +64,24 @@ class EvidenceUtilsTest(unittest.TestCase):
         self.assertEqual(len(parsed["evidence"]), 3)
         self.assertTrue(any(item["match_type"] == "fuzzy" for item in parsed["evidence"]))
 
+    def test_parse_hybrid_output_fuzzy_anchor_multi_sentence_quote(self) -> None:
+        raw = """Narrative.\n```json\n{\n  "prediction": {"task_type": "success", "label": "likely"},\n  "evidence": [\n    {"quote": "Primary endpoint improved at week 24 and secondary endpoint improved by week 36.", "rationale": "cross-endpoint benefit", "confidence": 0.82},\n    {"quote": "randomized double blind", "rationale": "study quality", "confidence": 0.7},\n    {"quote": "n equals 1200", "rationale": "sample size", "confidence": 0.68}\n  ]\n}\n```"""
+        source = (
+            "Primary endpoint improved at week 24. Secondary endpoint improved by week 36. "
+            "The trial was randomized double blind with n equals 1200 participants."
+        )
+        parsed = asyncio.run(
+            parse_hybrid_output(
+                raw_text=raw,
+                source_text=source,
+                evidence_id_prefix="t3",
+                allow_fuzzy_quotes=True,
+            )
+        )
+        self.assertEqual(len(parsed["evidence"]), 3)
+        self.assertTrue(parsed["evidence"][0]["maskable"])
+        self.assertEqual(parsed["evidence"][0]["match_type"], "fuzzy")
+
     def test_select_evidence_union(self) -> None:
         evidence_index = [
             {

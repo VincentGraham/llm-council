@@ -26,6 +26,9 @@ Set:
 - `NGC_API_KEY` (required for NIM image/model pulls)
 - `DATA_DIR` (optional, defaults to `/data/results`)
 - `MODELS_YAML` (optional, defaults to `./models.yaml`)
+- `MODEL_ENDPOINT_HOST` (optional, defaults to `localhost`; set to a Docker DNS host when backend is containerized)
+- `MODEL_ENDPOINT_SCHEME` (optional, defaults to `http`)
+- `MODEL_ENDPOINT_<MODEL_NAME>` (optional per-model endpoint override, e.g. `MODEL_ENDPOINT_QWEN2_5_72B_INSTRUCT`)
 
 ### 2. Edit `models.yaml`
 
@@ -36,6 +39,7 @@ Set:
 - request model IDs (`request_model`, optional)
 - extractor model (`extractor_model`, optional, defaults to chairman)
 - deliberation controls (`deliberation.*`) for observer mode + early stopping
+- stage-specific inference controls (`inference.round1`, `inference.round_n`, `inference.synthesis`, `inference.extractor`)
 - NIM images
 - GPU assignments
 - ports
@@ -83,6 +87,11 @@ uv sync
   "allow_fuzzy_quotes": false,
   "early_stopping": true,
   "min_rounds_before_stop": 2,
+  "inference": {
+    "round1": {"temperature": 0.7, "max_tokens": 2200},
+    "round_n": {"temperature": 0.5, "max_tokens": 2200},
+    "synthesis": {"temperature": 0.25, "max_tokens": 1800}
+  },
   "metadata": {"study_id": "NCT..."}
 }
 ```
@@ -148,6 +157,7 @@ Each prompt result now includes:
 - `synthesis`
 - `actual_rounds`, `stopped_early`, `early_stop_reason`
 - `deliberation_meta`
+- `usage_summary` (prompt/completion/total tokens aggregated across rounds + syntheses)
 - `evidence_index[]`
 - `counterfactual` (when derived from masked rerun)
 
@@ -159,6 +169,7 @@ Per response includes:
 - `structured_parse_status`
 - `structured_parse_errors`
 - `response` (narrative text)
+- `usage` (token usage if returned by model endpoint)
 
 ## Verification
 

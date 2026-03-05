@@ -118,7 +118,7 @@ def build_compose(config: dict[str, Any]) -> dict[str, Any]:
             "restart": "unless-stopped",
         }
 
-    return {"version": "3.9", "services": services}
+    return {"services": services}
 
 
 def write_compose(compose: dict[str, Any], path: Path) -> None:

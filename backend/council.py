@@ -15,8 +15,11 @@ from .config import (
     COUNCIL_MODELS,
     EARLY_STOP_ENABLED_DEFAULT,
     EARLY_STOP_MIN_ROUNDS,
+    ROUND1_INFERENCE_PARAMS,
+    ROUND_N_INFERENCE_PARAMS,
     OBSERVER_CHAIRMAN_MODE,
     ROUNDS,
+    SYNTHESIS_INFERENCE_PARAMS,
     SYNTHESIS_SIMILARITY_THRESHOLD,
 )
 from .evidence import (
@@ -59,6 +62,10 @@ def _normalize_deliberation_input(
     if isinstance(trial_text, str):
         trial_text = trial_text.strip()
 
+    inference = source.get("inference")
+    if inference is not None and not isinstance(inference, dict):
+        raise ValueError("'inference' must be an object keyed by stage name.")
+
     normalized = {
         "prompt": merged_prompt or None,
         "trial_text": trial_text or None,
@@ -67,6 +74,7 @@ def _normalize_deliberation_input(
         "metadata": source.get("metadata"),
         "early_stopping": source.get("early_stopping"),
         "min_rounds_before_stop": source.get("min_rounds_before_stop"),
+        "inference": inference,
     }
 
     if not normalized["prompt"] and not normalized["trial_text"]:
@@ -114,6 +122,115 @@ FINAL RANKING:
 2. Response Y
 ...
 Only use provided labels."""
+
+
+COUNCIL_MEMBER_SYSTEM_PROMPT = """You are an expert research council member.
+Reason carefully before answering and use chain-of-thought style analysis internally.
+In visible output, provide concise reasoning steps grounded in the provided text and avoid speculation."""
+
+
+SYNTHESIS_SYSTEM_PROMPT = """You are the chairman of a research-grade LLM council.
+Integrate evidence from all model rounds and produce a precise final synthesis with concise reasoning steps."""
+
+
+def _normalize_usage(usage: Any) -> dict[str, int] | None:
+    if not isinstance(usage, dict):
+        return None
+
+    normalized: dict[str, int] = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = usage.get(key)
+        if value is None:
+            continue
+        try:
+            normalized[key] = int(value)
+        except (TypeError, ValueError):
+            continue
+
+    return normalized or None
+
+
+def _sanitize_generation_params(params: Any) -> dict[str, Any]:
+    if not isinstance(params, dict):
+        return {}
+
+    sanitized: dict[str, Any] = {}
+    if params.get("temperature") is not None:
+        try:
+            temperature = float(params["temperature"])
+            if 0.0 <= temperature <= 2.0:
+                sanitized["temperature"] = temperature
+        except (TypeError, ValueError):
+            pass
+    if params.get("max_tokens") is not None:
+        try:
+            value = int(params["max_tokens"])
+            if value > 0:
+                sanitized["max_tokens"] = value
+        except (TypeError, ValueError):
+            pass
+    if params.get("top_p") is not None:
+        try:
+            top_p = float(params["top_p"])
+            if 0.0 < top_p <= 1.0:
+                sanitized["top_p"] = top_p
+        except (TypeError, ValueError):
+            pass
+    return sanitized
+
+
+def _resolve_stage_inference(
+    request_payload: dict[str, Any],
+    stage_name: str,
+    default_params: dict[str, Any],
+) -> dict[str, Any]:
+    resolved = dict(default_params)
+    request_inference = request_payload.get("inference")
+    if not isinstance(request_inference, dict):
+        return resolved
+
+    stage_overrides = request_inference.get(stage_name)
+    if stage_overrides is None and stage_name == "round_n":
+        stage_overrides = request_inference.get("roundn")
+    resolved.update(_sanitize_generation_params(stage_overrides))
+    return resolved
+
+
+def _summarize_usage(
+    all_rounds: list[dict[str, Any]],
+    round_syntheses: list[dict[str, Any]],
+) -> dict[str, Any]:
+    totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    by_model: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    )
+    calls_with_usage = 0
+
+    def consume(model: str | None, usage: Any) -> None:
+        nonlocal calls_with_usage
+        normalized = _normalize_usage(usage)
+        if normalized is None:
+            return
+        calls_with_usage += 1
+        model_name = model or "unknown"
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = normalized.get(key, 0)
+            totals[key] += value
+            by_model[model_name][key] += value
+
+    for round_data in all_rounds:
+        for response in round_data.get("responses", []):
+            consume(response.get("model"), response.get("usage"))
+
+    for synthesis_entry in round_syntheses:
+        synthesis = synthesis_entry.get("synthesis") or {}
+        consume(synthesis.get("model"), synthesis.get("usage"))
+
+    return {
+        "calls_with_usage": calls_with_usage,
+        "totals": totals,
+        "by_model": dict(sorted(by_model.items(), key=lambda item: item[0])),
+    }
 
 
 def _format_responses_with_labels(
@@ -274,14 +391,24 @@ async def _parse_and_attach_structure(
     return parsed
 
 
-async def round_1(request_payload: dict[str, Any]) -> dict[str, Any]:
+async def round_1(
+    request_payload: dict[str, Any],
+    generation_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Round 1: all council models answer the prompt independently."""
     base_prompt = _primary_prompt_from_request(request_payload)
-    messages = [{
-        "role": "user",
-        "content": f"{base_prompt}\n\n{STRUCTURED_OUTPUT_INSTRUCTIONS}",
-    }]
-    responses = await query_models_parallel(COUNCIL_MODELS, messages)
+    messages = [
+        {"role": "system", "content": COUNCIL_MEMBER_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": f"{base_prompt}\n\n{STRUCTURED_OUTPUT_INSTRUCTIONS}",
+        },
+    ]
+    responses = await query_models_parallel(
+        COUNCIL_MODELS,
+        messages,
+        generation_params=generation_params,
+    )
 
     round_responses = []
     for model in COUNCIL_MODELS:
@@ -296,6 +423,7 @@ async def round_1(request_payload: dict[str, Any]) -> dict[str, Any]:
                     "structured_json": None,
                     "structured_parse_status": "failed",
                     "structured_parse_errors": ["no_response_from_model"],
+                    "usage": None,
                     "status": "error",
                     "error": "No response from model",
                 }
@@ -319,6 +447,7 @@ async def round_1(request_payload: dict[str, Any]) -> dict[str, Any]:
                 "structured_parse_status": structured["structured_parse_status"],
                 "structured_parse_errors": structured["structured_parse_errors"],
                 "reasoning_details": response.get("reasoning_details"),
+                "usage": _normalize_usage(response.get("usage")),
                 "status": "ok",
             }
         )
@@ -399,6 +528,7 @@ async def round_n(
     n: int,
     prior_syntheses: list[dict[str, Any]] | None = None,
     observer_chairman: bool = True,
+    generation_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Round n: each model critiques/refines using prior rounds from other models."""
     if n < 2:
@@ -417,9 +547,17 @@ async def round_n(
             observer_chairman=observer_chairman,
         )
         messages_by_model[model] = [{"role": "user", "content": prompt_text}]
+        messages_by_model[model].insert(
+            0,
+            {"role": "system", "content": COUNCIL_MEMBER_SYSTEM_PROMPT},
+        )
         label_maps[model] = label_map
 
-    responses = await query_models_parallel(COUNCIL_MODELS, messages_by_model)
+    responses = await query_models_parallel(
+        COUNCIL_MODELS,
+        messages_by_model,
+        generation_params=generation_params,
+    )
 
     round_responses = []
     for model in COUNCIL_MODELS:
@@ -437,6 +575,7 @@ async def round_n(
                     "structured_parse_errors": ["no_response_from_model"],
                     "parsed_ranking": [],
                     "label_to_model": label_maps[model],
+                    "usage": None,
                     "status": "error",
                     "error": "No response from model",
                 }
@@ -463,6 +602,7 @@ async def round_n(
                 "parsed_ranking": parse_ranking_from_text(raw_text),
                 "label_to_model": label_maps[model],
                 "reasoning_details": response.get("reasoning_details"),
+                "usage": _normalize_usage(response.get("usage")),
                 "status": "ok",
             }
         )
@@ -481,6 +621,7 @@ async def synthesize(
     request_payload: dict[str, Any],
     all_rounds: list[dict[str, Any]],
     synthesis_round: int | None = None,
+    generation_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Chairman synthesizes current council state."""
     rounds_text_parts = []
@@ -514,7 +655,11 @@ clear reasoning, and actionable output when relevant.
 
     response = await query_model(
         model=CHAIRMAN_MODEL,
-        messages=[{"role": "user", "content": chairman_prompt}],
+        messages=[
+            {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
+            {"role": "user", "content": chairman_prompt},
+        ],
+        **(generation_params or {}),
     )
 
     if response is None:
@@ -527,6 +672,7 @@ clear reasoning, and actionable output when relevant.
             "structured_json": None,
             "structured_parse_status": "failed",
             "structured_parse_errors": ["no_response_from_model"],
+            "usage": None,
             "status": "error",
             "created_at": _utcnow(),
         }
@@ -549,6 +695,7 @@ clear reasoning, and actionable output when relevant.
         "structured_parse_status": structured["structured_parse_status"],
         "structured_parse_errors": structured["structured_parse_errors"],
         "reasoning_details": response.get("reasoning_details"),
+        "usage": _normalize_usage(response.get("usage")),
         "status": "ok",
         "created_at": _utcnow(),
     }
@@ -584,6 +731,23 @@ async def run_deliberation(
     except (TypeError, ValueError) as exc:
         raise ValueError("min_rounds_before_stop must be an integer >= 1") from exc
 
+    round1_params = _resolve_stage_inference(request_payload, "round1", ROUND1_INFERENCE_PARAMS)
+    round_n_params = _resolve_stage_inference(request_payload, "round_n", ROUND_N_INFERENCE_PARAMS)
+    synthesis_params = _resolve_stage_inference(request_payload, "synthesis", SYNTHESIS_INFERENCE_PARAMS)
+
+    deliberation_meta = {
+        "observer_chairman": OBSERVER_CHAIRMAN_MODE,
+        "early_stopping_enabled": early_stopping_enabled,
+        "min_rounds_before_stop": min_rounds_before_stop,
+        "synthesis_similarity_threshold": SYNTHESIS_SIMILARITY_THRESHOLD,
+        "consensus_ratio_threshold": CONSENSUS_RATIO_THRESHOLD,
+        "inference_params": {
+            "round1": round1_params,
+            "round_n": round_n_params,
+            "synthesis": synthesis_params,
+        },
+    }
+
     resolved_batch_id = batch_id or str(uuid4())
     resolved_prompt_id = prompt_id or str(uuid4())
 
@@ -594,7 +758,10 @@ async def run_deliberation(
 
     for round_number in range(1, rounds + 1):
         if round_number == 1:
-            current_round = await round_1(request_payload)
+            current_round = await round_1(
+                request_payload,
+                generation_params=round1_params,
+            )
         else:
             current_round = await round_n(
                 request_payload,
@@ -602,6 +769,7 @@ async def run_deliberation(
                 round_number,
                 prior_syntheses=round_syntheses,
                 observer_chairman=OBSERVER_CHAIRMAN_MODE,
+                generation_params=round_n_params,
             )
 
         all_rounds.append(current_round)
@@ -621,6 +789,7 @@ async def run_deliberation(
             request_payload=request_payload,
             all_rounds=all_rounds,
             synthesis_round=round_number,
+            generation_params=synthesis_params,
         )
         consensus_ratio = _round_consensus_ratio(current_round.get("responses", []))
         similarity = _synthesis_similarity(previous_synthesis_text, observer_synthesis.get("response"))
@@ -653,13 +822,8 @@ async def run_deliberation(
                 "actual_rounds": len(all_rounds),
                 "stopped_early": False,
                 "early_stop_reason": None,
-                "deliberation_meta": {
-                    "observer_chairman": OBSERVER_CHAIRMAN_MODE,
-                    "early_stopping_enabled": early_stopping_enabled,
-                    "min_rounds_before_stop": min_rounds_before_stop,
-                    "synthesis_similarity_threshold": SYNTHESIS_SIMILARITY_THRESHOLD,
-                    "consensus_ratio_threshold": CONSENSUS_RATIO_THRESHOLD,
-                },
+                "usage_summary": _summarize_usage(all_rounds, round_syntheses),
+                "deliberation_meta": deliberation_meta,
             },
         )
 
@@ -669,7 +833,13 @@ async def run_deliberation(
             break
 
     final_synthesis = (
-        round_syntheses[-1]["synthesis"] if round_syntheses else await synthesize(request_payload, all_rounds)
+        round_syntheses[-1]["synthesis"]
+        if round_syntheses
+        else await synthesize(
+            request_payload,
+            all_rounds,
+            generation_params=synthesis_params,
+        )
     )
 
     actual_rounds = len(all_rounds)
@@ -698,14 +868,9 @@ async def run_deliberation(
             "actual_rounds": actual_rounds,
             "stopped_early": stopped_early,
             "early_stop_reason": early_stop_reason,
-            "deliberation_meta": {
-                "observer_chairman": OBSERVER_CHAIRMAN_MODE,
-                "early_stopping_enabled": early_stopping_enabled,
-                "min_rounds_before_stop": min_rounds_before_stop,
-                "synthesis_similarity_threshold": SYNTHESIS_SIMILARITY_THRESHOLD,
-                "consensus_ratio_threshold": CONSENSUS_RATIO_THRESHOLD,
-            },
-            "schema_version": 2,
+            "usage_summary": _summarize_usage(all_rounds, round_syntheses),
+            "deliberation_meta": deliberation_meta,
+            "schema_version": 3,
         },
     )
 
@@ -799,6 +964,7 @@ async def run_counterfactual_deliberation(
         "metadata": metadata or source_request.get("metadata"),
         "early_stopping": source_request.get("early_stopping"),
         "min_rounds_before_stop": source_request.get("min_rounds_before_stop"),
+        "inference": source_request.get("inference"),
     }
     if counterfactual_request.get("trial_text"):
         counterfactual_request["trial_text"] = masked_text

@@ -5,10 +5,13 @@ from __future__ import annotations
 import unittest
 
 from backend.council import (
+    _resolve_stage_inference,
     _round_consensus_ratio,
+    _summarize_usage,
     _should_early_stop,
     _synthesis_similarity,
 )
+from backend.config import ROUND1_INFERENCE_PARAMS
 
 
 class CouncilDynamicsTest(unittest.TestCase):
@@ -61,6 +64,25 @@ class CouncilDynamicsTest(unittest.TestCase):
             synthesis_similarity=1.0,
         )
         self.assertFalse(stop)
+
+    def test_resolve_stage_inference_overrides(self) -> None:
+        payload = {"inference": {"round1": {"temperature": 0.9, "max_tokens": 999}}}
+        resolved = _resolve_stage_inference(payload, "round1", ROUND1_INFERENCE_PARAMS)
+        self.assertEqual(resolved["temperature"], 0.9)
+        self.assertEqual(resolved["max_tokens"], 999)
+
+    def test_summarize_usage(self) -> None:
+        rounds = [
+            {"responses": [{"model": "m1", "usage": {"prompt_tokens": 10, "completion_tokens": 5}}]},
+            {"responses": [{"model": "m2", "usage": {"prompt_tokens": 7, "completion_tokens": 8}}]},
+        ]
+        syntheses = [
+            {"synthesis": {"model": "chair", "usage": {"prompt_tokens": 6, "completion_tokens": 4}}}
+        ]
+        summary = _summarize_usage(rounds, syntheses)
+        self.assertEqual(summary["calls_with_usage"], 3)
+        self.assertEqual(summary["totals"]["prompt_tokens"], 23)
+        self.assertEqual(summary["totals"]["completion_tokens"], 17)
 
 
 if __name__ == "__main__":

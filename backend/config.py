@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 
 load_dotenv()
@@ -30,6 +31,7 @@ class ModelConfig(BaseModel):
     gpus: str
     port: int
     request_model: str | None = None
+    endpoint: str | None = None
     chairman: bool = False
 
 
@@ -42,7 +44,7 @@ class DeliberationConfig(BaseModel):
     early_stopping: bool = True
     min_rounds_before_stop: int = 2
     synthesis_similarity_threshold: float = 0.985
-    consensus_ratio_threshold: float = 1.0
+    consensus_ratio_threshold: float = 0.8
 
     @model_validator(mode="after")
     def validate_ranges(self) -> "DeliberationConfig":
@@ -55,6 +57,45 @@ class DeliberationConfig(BaseModel):
         return self
 
 
+class StageInferenceConfig(BaseModel):
+    """Generation parameters for one deliberation stage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    temperature: float | None = None
+    max_tokens: int | None = None
+    top_p: float | None = None
+
+    @model_validator(mode="after")
+    def validate_ranges(self) -> "StageInferenceConfig":
+        if self.temperature is not None and not 0.0 <= self.temperature <= 2.0:
+            raise ValueError("'temperature' must be between 0 and 2")
+        if self.max_tokens is not None and self.max_tokens < 1:
+            raise ValueError("'max_tokens' must be >= 1")
+        if self.top_p is not None and not 0.0 < self.top_p <= 1.0:
+            raise ValueError("'top_p' must be in (0, 1]")
+        return self
+
+
+class InferenceConfig(BaseModel):
+    """Per-stage inference controls for council runs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    round1: StageInferenceConfig = Field(
+        default_factory=lambda: StageInferenceConfig(temperature=0.7, max_tokens=2200)
+    )
+    round_n: StageInferenceConfig = Field(
+        default_factory=lambda: StageInferenceConfig(temperature=0.5, max_tokens=2200)
+    )
+    synthesis: StageInferenceConfig = Field(
+        default_factory=lambda: StageInferenceConfig(temperature=0.25, max_tokens=1800)
+    )
+    extractor: StageInferenceConfig = Field(
+        default_factory=lambda: StageInferenceConfig(temperature=0.0, max_tokens=1200)
+    )
+
+
 class CouncilConfig(BaseModel):
     """Top-level models.yaml configuration."""
 
@@ -62,7 +103,8 @@ class CouncilConfig(BaseModel):
 
     rounds: int = 3
     extractor_model: str | None = None
-    deliberation: DeliberationConfig = DeliberationConfig()
+    deliberation: DeliberationConfig = Field(default_factory=DeliberationConfig)
+    inference: InferenceConfig = Field(default_factory=InferenceConfig)
     models: list[ModelConfig]
 
     @model_validator(mode="after")
@@ -112,10 +154,21 @@ ROUNDS = _MODELS_CONFIG.rounds
 
 COUNCIL_MODELS = [model["name"] for model in MODELS]
 MODEL_CONFIG_BY_NAME = {model["name"]: model for model in MODELS}
-MODEL_ENDPOINTS = {
-    model["name"]: f"http://localhost:{model['port']}/v1"
-    for model in MODELS
-}
+MODEL_ENDPOINT_HOST = os.getenv("MODEL_ENDPOINT_HOST", "localhost")
+MODEL_ENDPOINT_SCHEME = os.getenv("MODEL_ENDPOINT_SCHEME", "http")
+
+
+def _endpoint_env_var_name(model_name: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", model_name).upper().strip("_")
+    return f"MODEL_ENDPOINT_{normalized}"
+
+
+MODEL_ENDPOINTS = {}
+for model in MODELS:
+    env_override = os.getenv(_endpoint_env_var_name(model["name"]))
+    fallback = f"{MODEL_ENDPOINT_SCHEME}://{MODEL_ENDPOINT_HOST}:{model['port']}/v1"
+    MODEL_ENDPOINTS[model["name"]] = env_override or model.get("endpoint") or fallback
+
 MODEL_REQUEST_NAMES = {
     model["name"]: model.get("request_model", model["name"])
     for model in MODELS
@@ -134,3 +187,8 @@ EARLY_STOP_ENABLED_DEFAULT = _MODELS_CONFIG.deliberation.early_stopping
 EARLY_STOP_MIN_ROUNDS = _MODELS_CONFIG.deliberation.min_rounds_before_stop
 SYNTHESIS_SIMILARITY_THRESHOLD = _MODELS_CONFIG.deliberation.synthesis_similarity_threshold
 CONSENSUS_RATIO_THRESHOLD = _MODELS_CONFIG.deliberation.consensus_ratio_threshold
+
+ROUND1_INFERENCE_PARAMS = _MODELS_CONFIG.inference.round1.model_dump(exclude_none=True)
+ROUND_N_INFERENCE_PARAMS = _MODELS_CONFIG.inference.round_n.model_dump(exclude_none=True)
+SYNTHESIS_INFERENCE_PARAMS = _MODELS_CONFIG.inference.synthesis.model_dump(exclude_none=True)
+EXTRACTOR_INFERENCE_PARAMS = _MODELS_CONFIG.inference.extractor.model_dump(exclude_none=True)

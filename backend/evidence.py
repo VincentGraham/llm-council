@@ -7,7 +7,12 @@ import re
 from difflib import SequenceMatcher
 from typing import Any
 
-from .config import EVIDENCE_MAX_ITEMS, EVIDENCE_MIN_ITEMS, EXTRACTOR_MODEL
+from .config import (
+    EVIDENCE_MAX_ITEMS,
+    EVIDENCE_MIN_ITEMS,
+    EXTRACTOR_INFERENCE_PARAMS,
+    EXTRACTOR_MODEL,
+)
 from .inference import query_model
 
 
@@ -153,20 +158,50 @@ def _normalize_evidence(structured_json: dict[str, Any]) -> list[dict[str, Any]]
     return normalized
 
 
+def _window_lengths(target_len: int, source_len: int) -> list[int]:
+    if source_len <= 0:
+        return []
+    base = max(24, target_len)
+    scales = (0.7, 0.85, 1.0, 1.15, 1.3)
+    windows = {
+        max(24, min(source_len, int(base * scale)))
+        for scale in scales
+    }
+    return sorted(windows)
+
+
+def _iter_window_starts(source_len: int, window_len: int) -> list[int]:
+    if window_len >= source_len:
+        return [0]
+    stride = max(1, window_len // 8)
+    starts = list(range(0, source_len - window_len + 1, stride))
+    last_start = source_len - window_len
+    if not starts or starts[-1] != last_start:
+        starts.append(last_start)
+    return starts
+
+
 def _find_fuzzy_span(quote: str, source_text: str) -> tuple[int, int] | None:
     quote_norm = _normalize_whitespace(quote).lower()
     if not quote_norm:
         return None
 
     best: tuple[float, int, int] | None = None
-    for match in re.finditer(r"[^.!?\n]+(?:[.!?\n]|$)", source_text):
-        candidate = match.group(0).strip()
-        if not candidate:
-            continue
-        candidate_norm = _normalize_whitespace(candidate).lower()
-        score = SequenceMatcher(None, quote_norm, candidate_norm).ratio()
-        if best is None or score > best[0]:
-            best = (score, match.start(), match.end())
+
+    source_len = len(source_text)
+    for window_len in _window_lengths(len(quote.strip()), source_len):
+        for start in _iter_window_starts(source_len, window_len):
+            end = start + window_len
+            candidate = source_text[start:end]
+            candidate_norm = _normalize_whitespace(candidate).lower()
+            if not candidate_norm:
+                continue
+
+            score = SequenceMatcher(None, quote_norm, candidate_norm).ratio()
+            if best is None or score > best[0]:
+                best = (score, start, end)
+                if score >= 0.995:
+                    return start, end
 
     if best and best[0] >= 0.84:
         return best[1], best[2]
@@ -239,7 +274,16 @@ Model output:
         model=extractor_model,
         messages=[{"role": "user", "content": prompt}],
         timeout=300.0,
+        response_format={"type": "json_object"},
+        **EXTRACTOR_INFERENCE_PARAMS,
     )
+    if response is None:
+        response = await query_model(
+            model=extractor_model,
+            messages=[{"role": "user", "content": prompt}],
+            timeout=300.0,
+            **EXTRACTOR_INFERENCE_PARAMS,
+        )
     if response is None:
         raise ValueError("Extractor model did not return a response.")
     repaired_text = response.get("content", "")
