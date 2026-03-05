@@ -151,6 +151,7 @@ async def query_model(
         payload["response_format"] = response_format
     payload = _merge_extra_body(payload, extra_body)
 
+    data: dict[str, Any] | None = None
     for attempt in range(_QUERY_RETRIES + 1):
         try:
             client = await _get_shared_client()
@@ -202,6 +203,9 @@ async def query_model(
         except Exception:  # pylint: disable=broad-except
             logger.exception("Unexpected error querying model %s", model)
             return None
+
+    if data is None:
+        return None
 
     choices = data.get("choices") or []
     if not choices:
