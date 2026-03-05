@@ -1,7 +1,7 @@
 services:
-  llama-3-1-70b-instruct:
-    image: nvcr.io/nim/meta/llama-3_1-70b-instruct:latest
-    container_name: nim-llama-3-1-70b-instruct
+  llama-3-1-nemotron-70b-instruct:
+    image: nvcr.io/nim/nvidia/llama-3_1-nemotron-70b-instruct:latest
+    container_name: nim-llama-3-1-nemotron-70b-instruct
     ipc: host
     ulimits:
       memlock: -1
@@ -36,9 +36,9 @@ services:
       retries: 40
       start_period: 120s
     restart: unless-stopped
-  qwen2-5-72b-instruct:
-    image: nvcr.io/nim/qwen/qwen2_5-72b-instruct:latest
-    container_name: nim-qwen2-5-72b-instruct
+  llama-3-3-nemotron-super-49b-v1:
+    image: nvcr.io/nim/nvidia/llama-3_3-nemotron-super-49b-v1:latest
+    container_name: nim-llama-3-3-nemotron-super-49b-v1
     ipc: host
     ulimits:
       memlock: -1
@@ -73,9 +73,9 @@ services:
       retries: 40
       start_period: 120s
     restart: unless-stopped
-  mistral-large-instruct:
-    image: nvcr.io/nim/mistralai/mistral-large-instruct:latest
-    container_name: nim-mistral-large-instruct
+  qwen2-5-32b-instruct:
+    image: nvcr.io/nim/qwen/qwen2_5-32b-instruct:latest
+    container_name: nim-qwen2-5-32b-instruct
     ipc: host
     ulimits:
       memlock: -1
@@ -110,9 +110,9 @@ services:
       retries: 40
       start_period: 120s
     restart: unless-stopped
-  nemotron-4-340b-instruct:
-    image: nvcr.io/nim/nvidia/nemotron-4-340b-instruct:latest
-    container_name: nim-nemotron-4-340b-instruct
+  llama-3-3-nemotron-super-49b-v1-b:
+    image: nvcr.io/nim/nvidia/llama-3_3-nemotron-super-49b-v1:latest
+    container_name: nim-llama-3-3-nemotron-super-49b-v1-b
     ipc: host
     ulimits:
       memlock: -1
