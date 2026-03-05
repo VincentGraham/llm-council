@@ -1219,12 +1219,25 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Fail if output directories are unavailable/not writable. Default: true.",
     )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL", "NONE"],
+        default="INFO",
+        help="Logging verbosity for pipeline output. Use NONE to disable logging entirely.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = parse_args()
+    if args.log_level == "NONE":
+        logging.disable(logging.CRITICAL)
+    else:
+        logging.basicConfig(
+            level=getattr(logging, args.log_level),
+            format="%(levelname)s %(message)s",
+        )
     asyncio.run(execute_pipeline(args))
     return 0
 
