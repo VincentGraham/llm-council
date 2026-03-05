@@ -7,8 +7,9 @@ Backend-only LLM council that runs local NVIDIA NIM containers (vLLM backend), s
 ## What Changed
 
 - Local NIM/OpenAI-compatible inference (no OpenRouter).
-- Configurable N-round council deliberation.
+- Configurable N-round council deliberation with dynamic early stopping.
 - Structured prediction + evidence extraction (3-5 evidence items) for every model response and synthesis.
+- Observer-chairman trajectory: chairman synthesis is saved after every round.
 - Evidence index endpoint for research workflows.
 - Counterfactual endpoint to mask selected evidence spans and rerun the full council.
 
@@ -34,6 +35,7 @@ Set:
 - model names
 - request model IDs (`request_model`, optional)
 - extractor model (`extractor_model`, optional, defaults to chairman)
+- deliberation controls (`deliberation.*`) for observer mode + early stopping
 - NIM images
 - GPU assignments
 - ports
@@ -79,6 +81,8 @@ uv sync
   "prediction_target": "duration|price|success|...",
   "rounds": 3,
   "allow_fuzzy_quotes": false,
+  "early_stopping": true,
+  "min_rounds_before_stop": 2,
   "metadata": {"study_id": "NCT..."}
 }
 ```
@@ -140,7 +144,10 @@ Each prompt result now includes:
 - `schema_version`
 - `request`
 - `rounds[]`
+- `round_syntheses[]` (chairman synthesis trajectory by round)
 - `synthesis`
+- `actual_rounds`, `stopped_early`, `early_stop_reason`
+- `deliberation_meta`
 - `evidence_index[]`
 - `counterfactual` (when derived from masked rerun)
 

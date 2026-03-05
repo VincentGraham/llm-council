@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 import httpx
 
 from .config import COUNCIL_MODELS, MODEL_ENDPOINTS, MODEL_REQUEST_NAMES
+
+logger = logging.getLogger(__name__)
 
 
 def _message_content_to_text(content: Any) -> str:
@@ -39,7 +42,7 @@ async def query_model(
     """
     base_url = endpoint or MODEL_ENDPOINTS.get(model)
     if not base_url:
-        print(f"Model endpoint not configured for {model}")
+        logger.error("Model endpoint not configured for %s", model)
         return None
 
     payload = {
@@ -52,8 +55,8 @@ async def query_model(
             response = await client.post(f"{base_url}/chat/completions", json=payload)
             response.raise_for_status()
             data = response.json()
-    except Exception as exc:  # pylint: disable=broad-except
-        print(f"Error querying model {model}: {exc}")
+    except Exception:  # pylint: disable=broad-except
+        logger.exception("Error querying model %s", model)
         return None
 
     choices = data.get("choices") or []
@@ -113,6 +116,7 @@ async def health_check(model: str, timeout: float = 10.0) -> dict[str, Any]:
             "available_models": models,
         }
     except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Health check failed for model %s: %s", model, exc)
         return {
             "model": model,
             "endpoint": base_url,

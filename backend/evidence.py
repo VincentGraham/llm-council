@@ -353,27 +353,47 @@ def build_evidence_index(result: dict[str, Any]) -> list[dict[str, Any]]:
                     }
                 )
 
-    synthesis = result.get("synthesis") or {}
-    synthesis_round = result.get("rounds_expected")
-    for evidence in synthesis.get("evidence", []):
-        items.append(
+    round_syntheses = result.get("round_syntheses")
+    if isinstance(round_syntheses, list) and round_syntheses:
+        synthesis_entries = [
             {
-                "evidence_id": evidence.get("evidence_id"),
-                "batch_id": batch_id,
-                "prompt_id": prompt_id,
-                "model": synthesis.get("model"),
-                "round": synthesis_round,
-                "is_synthesis": True,
-                "quote": evidence.get("quote"),
-                "rationale": evidence.get("rationale"),
-                "confidence": evidence.get("confidence"),
-                "source_tag": evidence.get("source_tag"),
-                "span_start": evidence.get("span_start"),
-                "span_end": evidence.get("span_end"),
-                "match_type": evidence.get("match_type"),
-                "maskable": evidence.get("maskable", False),
+                "round": entry.get("round"),
+                "synthesis": entry.get("synthesis") or {},
             }
-        )
+            for entry in round_syntheses
+            if isinstance(entry, dict)
+        ]
+    else:
+        synthesis_entries = [
+            {
+                "round": result.get("rounds_expected"),
+                "synthesis": result.get("synthesis") or {},
+            }
+        ]
+
+    for entry in synthesis_entries:
+        synthesis = entry.get("synthesis") or {}
+        synthesis_round = entry.get("round")
+        for evidence in synthesis.get("evidence", []):
+            items.append(
+                {
+                    "evidence_id": evidence.get("evidence_id"),
+                    "batch_id": batch_id,
+                    "prompt_id": prompt_id,
+                    "model": synthesis.get("model"),
+                    "round": synthesis_round,
+                    "is_synthesis": True,
+                    "synthesis_round": synthesis_round,
+                    "quote": evidence.get("quote"),
+                    "rationale": evidence.get("rationale"),
+                    "confidence": evidence.get("confidence"),
+                    "source_tag": evidence.get("source_tag"),
+                    "span_start": evidence.get("span_start"),
+                    "span_end": evidence.get("span_end"),
+                    "match_type": evidence.get("match_type"),
+                    "maskable": evidence.get("maskable", False),
+                }
+            )
 
     items.sort(
         key=lambda item: (

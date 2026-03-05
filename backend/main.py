@@ -29,6 +29,8 @@ class DeliberationInputRequest(BaseModel):
     prediction_target: str | None = None
     rounds: int | None = Field(default=None, ge=1)
     allow_fuzzy_quotes: bool = False
+    early_stopping: bool | None = None
+    min_rounds_before_stop: int | None = Field(default=None, ge=1)
     metadata: dict[str, Any] | None = None
 
 

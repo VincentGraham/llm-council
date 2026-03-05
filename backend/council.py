@@ -5,10 +5,20 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from typing import Any
 from uuid import uuid4
 
-from .config import CHAIRMAN_MODEL, COUNCIL_MODELS, ROUNDS
+from .config import (
+    CHAIRMAN_MODEL,
+    CONSENSUS_RATIO_THRESHOLD,
+    COUNCIL_MODELS,
+    EARLY_STOP_ENABLED_DEFAULT,
+    EARLY_STOP_MIN_ROUNDS,
+    OBSERVER_CHAIRMAN_MODE,
+    ROUNDS,
+    SYNTHESIS_SIMILARITY_THRESHOLD,
+)
 from .evidence import (
     build_evidence_index,
     mask_source_text,
@@ -55,6 +65,8 @@ def _normalize_deliberation_input(
         "prediction_target": source.get("prediction_target"),
         "allow_fuzzy_quotes": bool(source.get("allow_fuzzy_quotes", False)),
         "metadata": source.get("metadata"),
+        "early_stopping": source.get("early_stopping"),
+        "min_rounds_before_stop": source.get("min_rounds_before_stop"),
     }
 
     if not normalized["prompt"] and not normalized["trial_text"]:
@@ -178,6 +190,75 @@ def calculate_aggregate_rankings(
     return aggregate
 
 
+def _prediction_signature(prediction: dict[str, Any] | None) -> str | None:
+    if not isinstance(prediction, dict):
+        return None
+    if prediction.get("label"):
+        return f"label:{str(prediction['label']).strip().lower()}"
+    if prediction.get("probability") is not None:
+        return f"prob:{round(float(prediction['probability']), 3)}"
+    if prediction.get("value_numeric") is not None:
+        unit = prediction.get("unit") or ""
+        return f"num:{round(float(prediction['value_numeric']), 3)}:{unit}"
+    if prediction.get("value_text"):
+        return f"text:{str(prediction['value_text']).strip().lower()}"
+    return None
+
+
+def _round_consensus_ratio(round_responses: list[dict[str, Any]]) -> float:
+    signatures = []
+    for response in round_responses:
+        signature = _prediction_signature(response.get("prediction"))
+        if signature:
+            signatures.append(signature)
+
+    if not signatures:
+        return 0.0
+
+    counts = defaultdict(int)
+    for signature in signatures:
+        counts[signature] += 1
+
+    return max(counts.values()) / len(signatures)
+
+
+def _synthesis_similarity(previous: str | None, current: str | None) -> float | None:
+    if not previous or not current:
+        return None
+    prev_norm = " ".join(previous.split())
+    curr_norm = " ".join(current.split())
+    if not prev_norm or not curr_norm:
+        return None
+    return SequenceMatcher(None, prev_norm, curr_norm).ratio()
+
+
+def _should_early_stop(
+    round_number: int,
+    early_stopping_enabled: bool,
+    min_rounds_before_stop: int,
+    consensus_ratio: float,
+    synthesis_similarity: float | None,
+) -> tuple[bool, str | None]:
+    if not early_stopping_enabled:
+        return False, None
+    if round_number < min_rounds_before_stop:
+        return False, None
+
+    if consensus_ratio >= CONSENSUS_RATIO_THRESHOLD:
+        return True, (
+            f"consensus_ratio {consensus_ratio:.3f} >= threshold "
+            f"{CONSENSUS_RATIO_THRESHOLD:.3f}"
+        )
+
+    if synthesis_similarity is not None and synthesis_similarity >= SYNTHESIS_SIMILARITY_THRESHOLD:
+        return True, (
+            f"synthesis_similarity {synthesis_similarity:.3f} >= threshold "
+            f"{SYNTHESIS_SIMILARITY_THRESHOLD:.3f}"
+        )
+
+    return False, None
+
+
 async def _parse_and_attach_structure(
     *,
     raw_text: str,
@@ -254,6 +335,8 @@ def _build_round_n_prompt(
     model_name: str,
     request_payload: dict[str, Any],
     prior_rounds: list[dict[str, Any]],
+    prior_syntheses: list[dict[str, Any]] | None,
+    observer_chairman: bool,
 ) -> tuple[str, dict[str, str]]:
     prior_sections = []
 
@@ -277,6 +360,12 @@ def _build_round_n_prompt(
         "\n\n".join(latest_response_lines) if latest_response_lines else "No prior responses available."
     )
 
+    chairman_context = ""
+    if not observer_chairman and prior_syntheses:
+        latest_synthesis = prior_syntheses[-1].get("synthesis", {}).get("response", "")
+        if latest_synthesis:
+            chairman_context = f"\n\nLatest chairman synthesis (for reference):\n{latest_synthesis}"
+
     base_prompt = _primary_prompt_from_request(request_payload)
 
     prompt_text = f"""You are participating in round {len(prior_rounds) + 1} of an LLM council.
@@ -289,7 +378,7 @@ You are shown only anonymized responses from OTHER models in earlier rounds.
 {prior_text}
 
 For ranking, focus on the MOST RECENT prior round responses:
-{latest_text}
+{latest_text}{chairman_context}
 
 Your tasks:
 1. Critique the other responses with concrete reasoning.
@@ -308,6 +397,8 @@ async def round_n(
     request_payload: dict[str, Any],
     prior_rounds: list[dict[str, Any]],
     n: int,
+    prior_syntheses: list[dict[str, Any]] | None = None,
+    observer_chairman: bool = True,
 ) -> dict[str, Any]:
     """Round n: each model critiques/refines using prior rounds from other models."""
     if n < 2:
@@ -318,7 +409,13 @@ async def round_n(
     messages_by_model: dict[str, list[dict[str, str]]] = {}
     label_maps: dict[str, dict[str, str]] = {}
     for model in COUNCIL_MODELS:
-        prompt_text, label_map = _build_round_n_prompt(model, request_payload, prior_rounds)
+        prompt_text, label_map = _build_round_n_prompt(
+            model,
+            request_payload,
+            prior_rounds,
+            prior_syntheses=prior_syntheses,
+            observer_chairman=observer_chairman,
+        )
         messages_by_model[model] = [{"role": "user", "content": prompt_text}]
         label_maps[model] = label_map
 
@@ -383,8 +480,9 @@ async def round_n(
 async def synthesize(
     request_payload: dict[str, Any],
     all_rounds: list[dict[str, Any]],
+    synthesis_round: int | None = None,
 ) -> dict[str, Any]:
-    """Chairman synthesizes final response from all rounds."""
+    """Chairman synthesizes current council state."""
     rounds_text_parts = []
     for round_data in all_rounds:
         response_lines = []
@@ -405,10 +503,10 @@ async def synthesize(
 Original task:
 {base_prompt}
 
-Council deliberation rounds:
+Council deliberation rounds seen so far:
 {rounds_text}
 
-Synthesize a final answer for the user. Prioritize factual correctness,
+Synthesize the best current answer for the user. Prioritize factual correctness,
 clear reasoning, and actionable output when relevant.
 
 {STRUCTURED_OUTPUT_INSTRUCTIONS}
@@ -422,6 +520,7 @@ clear reasoning, and actionable output when relevant.
     if response is None:
         return {
             "model": CHAIRMAN_MODEL,
+            "synthesis_round": synthesis_round,
             "response": "Error: unable to generate synthesis.",
             "prediction": None,
             "evidence": [],
@@ -433,13 +532,15 @@ clear reasoning, and actionable output when relevant.
         }
 
     raw_text = response.get("content", "")
+    round_suffix = f"r{synthesis_round}" if synthesis_round is not None else "final"
     structured = await _parse_and_attach_structure(
         raw_text=raw_text,
         request_payload=request_payload,
-        evidence_id_prefix=f"s-{CHAIRMAN_MODEL}",
+        evidence_id_prefix=f"s-{round_suffix}-{CHAIRMAN_MODEL}",
     )
     return {
         "model": CHAIRMAN_MODEL,
+        "synthesis_round": synthesis_round,
         "raw_response": raw_text,
         "response": structured["response"],
         "prediction": structured["prediction"],
@@ -463,40 +564,52 @@ async def run_deliberation(
     deliberation_input: dict[str, Any] | None = None,
     counterfactual: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Run full N-round deliberation and persist results."""
+    """Run dynamic deliberation trajectory and persist results."""
     if rounds < 1:
         raise ValueError("rounds must be >= 1")
 
     request_payload = _normalize_deliberation_input(prompt=prompt, deliberation_input=deliberation_input)
     display_prompt = request_payload.get("prompt") or request_payload.get("trial_text") or ""
 
+    early_stopping_requested = request_payload.get("early_stopping")
+    early_stopping_enabled = (
+        EARLY_STOP_ENABLED_DEFAULT if early_stopping_requested is None else bool(early_stopping_requested)
+    )
+
+    min_rounds_before_stop = request_payload.get("min_rounds_before_stop")
+    if min_rounds_before_stop is None:
+        min_rounds_before_stop = EARLY_STOP_MIN_ROUNDS
+    try:
+        min_rounds_before_stop = max(1, int(min_rounds_before_stop))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("min_rounds_before_stop must be an integer >= 1") from exc
+
     resolved_batch_id = batch_id or str(uuid4())
     resolved_prompt_id = prompt_id or str(uuid4())
 
     all_rounds: list[dict[str, Any]] = []
+    round_syntheses: list[dict[str, Any]] = []
+    previous_synthesis_text: str | None = None
+    early_stop_reason: str | None = None
 
-    first_round = await round_1(request_payload)
-    all_rounds.append(first_round)
-    save_round(
-        batch_id=resolved_batch_id,
-        prompt_id=resolved_prompt_id,
-        prompt=display_prompt,
-        round_data=first_round,
-        rounds_expected=rounds,
-        prompt_index=prompt_index,
-        prompt_count=prompt_count,
-        request_payload=request_payload,
-        counterfactual=counterfactual,
-    )
+    for round_number in range(1, rounds + 1):
+        if round_number == 1:
+            current_round = await round_1(request_payload)
+        else:
+            current_round = await round_n(
+                request_payload,
+                all_rounds,
+                round_number,
+                prior_syntheses=round_syntheses,
+                observer_chairman=OBSERVER_CHAIRMAN_MODE,
+            )
 
-    for round_number in range(2, rounds + 1):
-        nth_round = await round_n(request_payload, all_rounds, round_number)
-        all_rounds.append(nth_round)
+        all_rounds.append(current_round)
         save_round(
             batch_id=resolved_batch_id,
             prompt_id=resolved_prompt_id,
             prompt=display_prompt,
-            round_data=nth_round,
+            round_data=current_round,
             rounds_expected=rounds,
             prompt_index=prompt_index,
             prompt_count=prompt_count,
@@ -504,12 +617,69 @@ async def run_deliberation(
             counterfactual=counterfactual,
         )
 
-    synthesis_result = await synthesize(request_payload, all_rounds)
+        observer_synthesis = await synthesize(
+            request_payload=request_payload,
+            all_rounds=all_rounds,
+            synthesis_round=round_number,
+        )
+        consensus_ratio = _round_consensus_ratio(current_round.get("responses", []))
+        similarity = _synthesis_similarity(previous_synthesis_text, observer_synthesis.get("response"))
+        stop_triggered, stop_reason = _should_early_stop(
+            round_number=round_number,
+            early_stopping_enabled=early_stopping_enabled,
+            min_rounds_before_stop=min_rounds_before_stop,
+            consensus_ratio=consensus_ratio,
+            synthesis_similarity=similarity,
+        )
+
+        round_syntheses.append(
+            {
+                "round": round_number,
+                "synthesis": observer_synthesis,
+                "consensus_ratio": round(consensus_ratio, 6),
+                "synthesis_similarity_to_prev": (
+                    round(similarity, 6) if similarity is not None else None
+                ),
+                "stop_triggered": stop_triggered,
+                "stop_reason": stop_reason,
+            }
+        )
+
+        update_prompt_result(
+            batch_id=resolved_batch_id,
+            prompt_id=resolved_prompt_id,
+            updates={
+                "round_syntheses": round_syntheses,
+                "actual_rounds": len(all_rounds),
+                "stopped_early": False,
+                "early_stop_reason": None,
+                "deliberation_meta": {
+                    "observer_chairman": OBSERVER_CHAIRMAN_MODE,
+                    "early_stopping_enabled": early_stopping_enabled,
+                    "min_rounds_before_stop": min_rounds_before_stop,
+                    "synthesis_similarity_threshold": SYNTHESIS_SIMILARITY_THRESHOLD,
+                    "consensus_ratio_threshold": CONSENSUS_RATIO_THRESHOLD,
+                },
+            },
+        )
+
+        previous_synthesis_text = observer_synthesis.get("response")
+        if stop_triggered:
+            early_stop_reason = stop_reason
+            break
+
+    final_synthesis = (
+        round_syntheses[-1]["synthesis"] if round_syntheses else await synthesize(request_payload, all_rounds)
+    )
+
+    actual_rounds = len(all_rounds)
+    stopped_early = actual_rounds < rounds
+
     stored = save_synthesis(
         batch_id=resolved_batch_id,
         prompt_id=resolved_prompt_id,
         prompt=display_prompt,
-        synthesis=synthesis_result,
+        synthesis=final_synthesis,
         rounds_expected=rounds,
         prompt_index=prompt_index,
         prompt_count=prompt_count,
@@ -517,12 +687,24 @@ async def run_deliberation(
         counterfactual=counterfactual,
     )
 
+    stored["round_syntheses"] = round_syntheses
     evidence_index = build_evidence_index(stored)
     updated = update_prompt_result(
         batch_id=resolved_batch_id,
         prompt_id=resolved_prompt_id,
         updates={
             "evidence_index": evidence_index,
+            "round_syntheses": round_syntheses,
+            "actual_rounds": actual_rounds,
+            "stopped_early": stopped_early,
+            "early_stop_reason": early_stop_reason,
+            "deliberation_meta": {
+                "observer_chairman": OBSERVER_CHAIRMAN_MODE,
+                "early_stopping_enabled": early_stopping_enabled,
+                "min_rounds_before_stop": min_rounds_before_stop,
+                "synthesis_similarity_threshold": SYNTHESIS_SIMILARITY_THRESHOLD,
+                "consensus_ratio_threshold": CONSENSUS_RATIO_THRESHOLD,
+            },
             "schema_version": 2,
         },
     )
@@ -615,6 +797,8 @@ async def run_counterfactual_deliberation(
         "prediction_target": source_request.get("prediction_target"),
         "allow_fuzzy_quotes": allow_fuzzy_quotes,
         "metadata": metadata or source_request.get("metadata"),
+        "early_stopping": source_request.get("early_stopping"),
+        "min_rounds_before_stop": source_request.get("min_rounds_before_stop"),
     }
     if counterfactual_request.get("trial_text"):
         counterfactual_request["trial_text"] = masked_text
