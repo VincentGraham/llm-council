@@ -262,8 +262,43 @@ def _utcnow() -> str:
 def _clean_text(value: Any) -> str | None:
     if value is None:
         return None
-    if pd.isna(value):
+
+    # Normalize array-likes (numpy/pandas) into python containers/scalars first.
+    if hasattr(value, "tolist") and not isinstance(value, (str, bytes, bytearray, dict)):
+        try:
+            normalized = value.tolist()
+        except Exception:  # pylint: disable=broad-except
+            normalized = value
+        if normalized is not value:
+            return _clean_text(normalized)
+
+    # Some model outputs return arrays/lists for fields expected to be scalar text.
+    # Collapse these safely instead of letting `pd.isna` return array-like masks.
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            cleaned = _clean_text(item)
+            if cleaned:
+                return cleaned
         return None
+    if isinstance(value, dict):
+        text = json.dumps(value, ensure_ascii=True).strip()
+        return text or None
+
+    try:
+        missing = pd.isna(value)
+    except Exception:  # pylint: disable=broad-except
+        missing = False
+
+    if isinstance(missing, bool):
+        if missing:
+            return None
+    else:
+        try:
+            if bool(missing.all()):
+                return None
+        except Exception:  # pylint: disable=broad-except
+            pass
+
     text = str(value).strip()
     return text or None
 
@@ -1026,11 +1061,10 @@ async def run_duration_pipeline(
         for trial_index, (_, series) in enumerate(input_df.iterrows(), start=1):
             trial_dict = series.to_dict()
             nct_id = _clean_text(trial_dict.get("nct_id")) or f"trial-{trial_index:05d}"
-            trial_round_updates = 0
+            trial_progress_units = 0
 
             async def on_round_progress(event: dict[str, Any]) -> None:
-                nonlocal trial_round_updates
-                trial_round_updates += 1
+                nonlocal trial_progress_units
                 run_type = _clean_text(event.get("run_type")) or "baseline"
                 round_number = _to_int(event.get("round")) or 0
                 rounds_expected = _to_int(event.get("rounds_expected")) or rounds
@@ -1045,12 +1079,15 @@ async def run_duration_pipeline(
                 else:
                     label = f"{nct_id} baseline round {round_number}/{rounds_expected}"
                 progress.advance_round(latest_line=label, metrics=metrics, units=1)
+                trial_progress_units += 1
                 if bool(event.get("stopped_early")) and rounds_expected > actual_rounds_so_far:
+                    skipped_units = rounds_expected - actual_rounds_so_far
                     progress.advance_round(
                         latest_line=f"{label} (early stop)",
                         metrics=metrics,
-                        units=rounds_expected - actual_rounds_so_far,
+                        units=skipped_units,
                     )
+                    trial_progress_units += skipped_units
 
             trial_rows = await _run_trial(
                 run_id=run_id,
@@ -1065,6 +1102,21 @@ async def run_duration_pipeline(
             )
             rows.extend(trial_rows)
 
+            expected_counterfactual_runs = sum(
+                1
+                for row_item in trial_rows
+                if row_item.get("run_type") == "counterfactual" and _clean_text(row_item.get("masked_evidence_id"))
+            )
+            planned_units = rounds + (expected_counterfactual_runs * rounds)
+            missing_units = planned_units - trial_progress_units
+            if missing_units > 0 and show_progress:
+                progress.advance_round(
+                    latest_line=f"{nct_id} progress reconcile",
+                    metrics=metrics,
+                    units=missing_units,
+                )
+                trial_progress_units += missing_units
+
             baseline_row = next(
                 (row for row in trial_rows if row.get("run_type") == "baseline"),
                 None,
@@ -1076,12 +1128,6 @@ async def run_duration_pipeline(
                     "error_message": "Baseline row missing",
                 }
 
-            if trial_round_updates == 0 and show_progress:
-                progress.advance_round(
-                    latest_line=f"{nct_id} baseline round {rounds}/{rounds}",
-                    metrics=metrics,
-                    units=rounds,
-                )
             metrics.update(
                 pred_months=_to_float(baseline_row.get("prediction_value_numeric")),
                 true_months=_to_float(baseline_row.get("true_duration_months")),

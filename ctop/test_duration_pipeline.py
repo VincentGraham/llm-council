@@ -21,6 +21,7 @@ try:
         LONG_OUTPUT_COLUMNS,
         _build_trial_text,
         _build_wide_predictions_df,
+        _clean_text,
         execute_pipeline,
         run_duration_pipeline,
     )
@@ -29,6 +30,7 @@ except ImportError:
         LONG_OUTPUT_COLUMNS,
         _build_trial_text,
         _build_wide_predictions_df,
+        _clean_text,
         execute_pipeline,
         run_duration_pipeline,
     )
@@ -232,6 +234,11 @@ class DurationPipelineTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("January 2020", trial_text)
         self.assertNotIn("October 2020", trial_text)
 
+    def test_clean_text_handles_array_like_values(self) -> None:
+        self.assertEqual(_clean_text([" months ", "days"]), "months")
+        self.assertEqual(_clean_text(pd.array([" months ", None], dtype="string")), "months")
+        self.assertIsNone(_clean_text(pd.array([None, pd.NA], dtype="object")))
+
     async def test_long_columns_and_wide_aggregates(self) -> None:
         input_df = _input_dataframe()
         with patch(
@@ -358,6 +365,57 @@ class DurationPipelineTest(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(snapshots, [(1, 1)])
+
+    async def test_progress_reconcile_fills_missing_units(self) -> None:
+        input_df = _input_dataframe()
+
+        class FakeProgressReporter:
+            latest_instance = None
+
+            def __init__(self, total: int, enabled: bool = True) -> None:
+                self.total = total
+                self.enabled = enabled
+                self.units = 0
+                FakeProgressReporter.latest_instance = self
+
+            def extend_total(self, units: int) -> None:
+                self.total += units
+
+            def advance_round(self, latest_line: str, metrics: object, units: int = 1) -> None:
+                self.units += units
+
+            def close(self) -> None:
+                return
+
+        baseline_error_row = {
+            "nct_id": "NCT00000001",
+            "run_type": "baseline",
+            "status": "error",
+            "error_message": "baseline failed",
+            "prediction_value_numeric": None,
+            "true_duration_months": 9.99,
+        }
+
+        with patch(
+            "ctop.run_duration_pipeline._run_trial",
+            new=AsyncMock(return_value=[baseline_error_row]),
+        ), patch(
+            "ctop.run_duration_pipeline.ProgressReporter",
+            new=FakeProgressReporter,
+        ):
+            await run_duration_pipeline(
+                input_df=input_df,
+                run_id="run12345",
+                prediction_target="duration",
+                rounds=3,
+                counterfactual_enabled=False,
+                allow_fuzzy_quotes=False,
+                show_progress=True,
+            )
+
+        reporter = FakeProgressReporter.latest_instance
+        self.assertIsNotNone(reporter)
+        self.assertEqual(reporter.units, reporter.total)
 
 
 if __name__ == "__main__":
