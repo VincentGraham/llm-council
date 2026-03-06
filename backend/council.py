@@ -129,6 +129,14 @@ def _primary_prompt_from_request(request_payload: dict[str, Any]) -> str:
     prediction_target = request_payload.get("prediction_target")
 
     if trial_text:
+        duration_guidance = ""
+        if isinstance(prediction_target, str) and "duration" in prediction_target.lower():
+            duration_guidance = (
+                "Target-specific guidance: predict the TOTAL trial duration from study "
+                "initialization/start to completion of the primary endpoint "
+                "(primary completion date). Do not predict intervention/treatment "
+                "duration or follow-up-only windows unless they represent the full trial."
+            )
         target_line = (
             f"Prediction target: {prediction_target}.\n"
             if prediction_target
@@ -136,7 +144,8 @@ def _primary_prompt_from_request(request_payload: dict[str, Any]) -> str:
         )
         preamble = """You are an expert forecaster for clinical trial outcomes.
 Use the provided trial text to predict the requested target and explain your reasoning."""
-        base = f"{preamble}\n\n{target_line}\nClinical trial text:\n{trial_text}".strip()
+        guidance_block = f"{duration_guidance}\n\n" if duration_guidance else ""
+        base = f"{preamble}\n\n{target_line}{guidance_block}Clinical trial text:\n{trial_text}".strip()
         if prompt:
             return f"Additional user instructions:\n{prompt}\n\n{base}".strip()
         return base

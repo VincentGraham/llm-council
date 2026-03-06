@@ -6,6 +6,7 @@ import unittest
 
 from backend.council import (
     _build_round_n_prompt,
+    _primary_prompt_from_request,
     _prediction_signature,
     _resolve_stage_inference,
     _round_consensus_ratio,
@@ -147,6 +148,26 @@ class CouncilDynamicsTest(unittest.TestCase):
             council_members=["m1", "m2", "m3"],
         )
         self.assertEqual(latest_map, {"Response B": "m3"})
+
+    def test_primary_prompt_duration_target_guidance(self) -> None:
+        prompt = _primary_prompt_from_request(
+            {
+                "trial_text": "Study text",
+                "prediction_target": "duration",
+            }
+        )
+        self.assertIn("TOTAL trial duration", prompt)
+        self.assertIn("primary endpoint", prompt)
+        self.assertIn("Do not predict intervention/treatment duration", prompt)
+
+    def test_primary_prompt_non_duration_target_has_no_duration_guidance(self) -> None:
+        prompt = _primary_prompt_from_request(
+            {
+                "trial_text": "Study text",
+                "prediction_target": "response_rate",
+            }
+        )
+        self.assertNotIn("TOTAL trial duration", prompt)
 
 
 if __name__ == "__main__":
