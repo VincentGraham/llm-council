@@ -1,5 +1,5 @@
 rounds: 3
-extractor_model: llama-3.3-nemotron-super-49b-v1
+extractor_model: nemotron-3-nano
 deliberation:
   observer_chairman: true
   share_synthesis_with_members: false
@@ -21,21 +21,21 @@ inference:
     temperature: 0.0
     max_tokens: 1000
 models:
+  - name: llama-3.3-nemotron-super-49b-v1.5
+    request_model: nvidia/llama-3.3-nemotron-super-49b-v1.5
+    image: nvcr.io/nim/nvidia/llama-3.3-nemotron-super-49b-v1.5:latest
+    gpus: "0,1"
+    port: 8011
+    chairman: false
   - name: llama-3.1-nemotron-70b-instruct
     request_model: nvidia/llama-3.1-nemotron-70b-instruct
     image: nvcr.io/nim/nvidia/llama-3_1-nemotron-70b-instruct:latest
-    gpus: "0,1"
-    port: 8011
-    chairman: true
-  - name: llama-3.3-nemotron-super-49b-v1
-    request_model: nvidia/llama-3.3-nemotron-super-49b-v1
-    image: nvcr.io/nim/nvidia/llama-3_3-nemotron-super-49b-v1:latest
     gpus: "2,3"
     port: 8012
     chairman: false
-  - name: qwen2.5-32b-instruct
-    request_model: qwen/qwen2.5-32b-instruct
-    image: nvcr.io/nim/qwen/qwen2_5-32b-instruct:latest
+  - name: llama-3.3-nemotron-super-49b-v1
+    request_model: nvidia/llama-3.3-nemotron-super-49b-v1
+    image: nvcr.io/nim/nvidia/llama-3_3-nemotron-super-49b-v1:latest
     gpus: "4,5"
     port: 8013
     chairman: false
@@ -44,4 +44,4 @@ models:
     image: nvcr.io/nim/nvidia/nemotron-3-nano:latest
     gpus: "6,7"
     port: 8014
-    chairman: false
+    chairman: true

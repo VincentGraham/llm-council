@@ -34,6 +34,7 @@ DEFAULT_EPSILON_MONTHS = 1.0
 DEFAULT_EMA_ALPHA = 0.12
 DEFAULT_SHORT_THRESHOLD_MONTHS = 12.0
 DEFAULT_CHECKPOINT_EVERY_TRIALS = 5
+DEFAULT_COUNTERFACTUAL_MAX_CONCURRENCY = 2
 
 SEMANTIC_TEXT_FIELDS = [
     ("Brief title", "brief_title"),
@@ -594,6 +595,7 @@ async def _run_trial(
     rounds: int,
     counterfactual_enabled: bool,
     allow_fuzzy_quotes: bool,
+    counterfactual_max_concurrency: int = DEFAULT_COUNTERFACTUAL_MAX_CONCURRENCY,
     round_progress_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     extend_progress_total_callback: Callable[[int], None] | None = None,
 ) -> list[dict[str, Any]]:
@@ -696,6 +698,12 @@ async def _run_trial(
         if isinstance(evidence_raw, list):
             evidence_items = [item for item in evidence_raw if isinstance(item, dict)]
 
+    evidence_items = [
+        item
+        for item in evidence_items
+        if _clean_text(item.get("evidence_id")) and bool(item.get("maskable", True))
+    ]
+
     if not evidence_items:
         return rows
 
@@ -725,10 +733,17 @@ async def _run_trial(
             )
         return rows
 
-    for cf_index, evidence in enumerate(evidence_items, start=1):
+    resolved_cf_concurrency = max(1, int(counterfactual_max_concurrency))
+    cf_semaphore = asyncio.Semaphore(resolved_cf_concurrency)
+
+    async def run_single_counterfactual(
+        cf_index: int,
+        evidence: dict[str, Any],
+    ) -> tuple[int, dict[str, Any]]:
         evidence_id = _clean_text(evidence.get("evidence_id"))
         if not evidence_id:
-            rows.append(
+            return (
+                cf_index,
                 _error_row(
                     run_id=run_id,
                     nct_id=nct_id,
@@ -744,9 +759,8 @@ async def _run_trial(
                     error_message="Final synthesis evidence item has no evidence_id.",
                     true_duration_days=true_duration_days,
                     true_duration_months=true_duration_months,
-                )
+                ),
             )
-            continue
 
         cf_metadata = {
             "nct_id": nct_id,
@@ -766,38 +780,40 @@ async def _run_trial(
             payload["masked_evidence_id"] = evidence_id
             await round_progress_callback(payload)
 
-        try:
-            cf_result = await run_counterfactual_deliberation(
-                source_batch_id=baseline_batch_id,
-                source_prompt_id=baseline_prompt_id,
-                evidence_ids=[evidence_id],
-                rounds=rounds,
-                allow_fuzzy_quotes=allow_fuzzy_quotes,
-                metadata=cf_metadata,
-                round_progress_callback=_counterfactual_round_progress if round_progress_callback else None,
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            rows.append(
-                _error_row(
-                    run_id=run_id,
-                    nct_id=nct_id,
-                    trial_index=trial_index,
-                    run_type="counterfactual",
-                    cf_index=cf_index,
-                    masked_evidence_id=evidence_id,
-                    batch_id=None,
-                    prompt_id=None,
-                    parent_batch_id=baseline_batch_id,
-                    parent_prompt_id=baseline_prompt_id,
-                    error_type=type(exc).__name__,
-                    error_message=str(exc),
-                    true_duration_days=true_duration_days,
-                    true_duration_months=true_duration_months,
+        async with cf_semaphore:
+            try:
+                cf_result = await run_counterfactual_deliberation(
+                    source_batch_id=baseline_batch_id,
+                    source_prompt_id=baseline_prompt_id,
+                    evidence_ids=[evidence_id],
+                    rounds=rounds,
+                    allow_fuzzy_quotes=allow_fuzzy_quotes,
+                    metadata=cf_metadata,
+                    round_progress_callback=_counterfactual_round_progress if round_progress_callback else None,
                 )
-            )
-            continue
+            except Exception as exc:  # pylint: disable=broad-except
+                return (
+                    cf_index,
+                    _error_row(
+                        run_id=run_id,
+                        nct_id=nct_id,
+                        trial_index=trial_index,
+                        run_type="counterfactual",
+                        cf_index=cf_index,
+                        masked_evidence_id=evidence_id,
+                        batch_id=None,
+                        prompt_id=None,
+                        parent_batch_id=baseline_batch_id,
+                        parent_prompt_id=baseline_prompt_id,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                        true_duration_days=true_duration_days,
+                        true_duration_months=true_duration_months,
+                    ),
+                )
 
-        rows.append(
+        return (
+            cf_index,
             _success_row(
                 run_id=run_id,
                 nct_id=nct_id,
@@ -810,8 +826,13 @@ async def _run_trial(
                 parent_prompt_id=baseline_prompt_id,
                 true_duration_days=true_duration_days,
                 true_duration_months=true_duration_months,
-            )
+            ),
         )
+
+    counterfactual_results = await asyncio.gather(
+        *(run_single_counterfactual(cf_index, evidence) for cf_index, evidence in enumerate(evidence_items, start=1))
+    )
+    rows.extend(row for _, row in sorted(counterfactual_results, key=lambda item: item[0]))
     return rows
 
 
@@ -992,6 +1013,7 @@ def _build_manifest(
     prediction_target: str,
     rounds: int,
     counterfactual_enabled: bool,
+    counterfactual_max_concurrency: int,
     allow_fuzzy_quotes: bool,
     max_trials: int | None,
     trial_count_input: int,
@@ -1018,6 +1040,7 @@ def _build_manifest(
         "prediction_target": prediction_target,
         "rounds": rounds,
         "counterfactual_enabled": counterfactual_enabled,
+        "counterfactual_max_concurrency": counterfactual_max_concurrency,
         "allow_fuzzy_quotes": allow_fuzzy_quotes,
         "max_trials": max_trials,
         "trial_count_input": trial_count_input,
@@ -1042,6 +1065,7 @@ async def run_duration_pipeline(
     rounds: int,
     counterfactual_enabled: bool,
     allow_fuzzy_quotes: bool,
+    counterfactual_max_concurrency: int = DEFAULT_COUNTERFACTUAL_MAX_CONCURRENCY,
     epsilon_months: float = DEFAULT_EPSILON_MONTHS,
     ema_alpha: float = DEFAULT_EMA_ALPHA,
     short_threshold_months: float = DEFAULT_SHORT_THRESHOLD_MONTHS,
@@ -1056,6 +1080,7 @@ async def run_duration_pipeline(
         short_threshold_months=short_threshold_months,
     )
     progress = ProgressReporter(total=len(input_df) * max(1, rounds), enabled=show_progress)
+    resolved_cf_concurrency = max(1, int(counterfactual_max_concurrency))
 
     try:
         for trial_index, (_, series) in enumerate(input_df.iterrows(), start=1):
@@ -1097,6 +1122,7 @@ async def run_duration_pipeline(
                 rounds=rounds,
                 counterfactual_enabled=counterfactual_enabled,
                 allow_fuzzy_quotes=allow_fuzzy_quotes,
+                counterfactual_max_concurrency=resolved_cf_concurrency,
                 round_progress_callback=on_round_progress if show_progress else None,
                 extend_progress_total_callback=progress.extend_total if show_progress else None,
             )
@@ -1171,6 +1197,8 @@ async def execute_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--short-threshold-months must be > 0.")
     if checkpoint_every_trials < 0:
         raise ValueError("--checkpoint-every-trials must be >= 0.")
+    if int(args.counterfactual_max_concurrency) < 1:
+        raise ValueError("--counterfactual-max-concurrency must be >= 1.")
 
     _ensure_writable_dir(output_root, strict=strict)
     run_output_dir = output_root / run_id
@@ -1208,6 +1236,7 @@ async def execute_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         prediction_target=str(args.prediction_target),
         rounds=rounds,
         counterfactual_enabled=bool(args.counterfactual),
+        counterfactual_max_concurrency=int(args.counterfactual_max_concurrency),
         allow_fuzzy_quotes=bool(args.allow_fuzzy_quotes),
         epsilon_months=float(args.epsilon_months),
         ema_alpha=float(args.ema_alpha),
@@ -1232,6 +1261,7 @@ async def execute_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         prediction_target=str(args.prediction_target),
         rounds=rounds,
         counterfactual_enabled=bool(args.counterfactual),
+        counterfactual_max_concurrency=int(args.counterfactual_max_concurrency),
         allow_fuzzy_quotes=bool(args.allow_fuzzy_quotes),
         max_trials=int(args.max_trials) if args.max_trials is not None else None,
         trial_count_input=trial_count_input,
@@ -1289,6 +1319,15 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable per-evidence counterfactual runs. Default: enabled.",
+    )
+    parser.add_argument(
+        "--counterfactual-max-concurrency",
+        type=int,
+        default=DEFAULT_COUNTERFACTUAL_MAX_CONCURRENCY,
+        help=(
+            "Maximum number of per-evidence counterfactual reruns to execute in parallel "
+            f"(default: {DEFAULT_COUNTERFACTUAL_MAX_CONCURRENCY})."
+        ),
     )
     parser.add_argument(
         "--allow-fuzzy-quotes",

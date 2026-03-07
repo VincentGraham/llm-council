@@ -38,6 +38,19 @@ def _to_float(value: Any) -> float | None:
     return None
 
 
+def _normalize_unit_interval_score(value: Any) -> float | None:
+    parsed = _to_float(value)
+    if parsed is None:
+        return None
+    if 0.0 <= parsed <= 1.0:
+        return parsed
+    if 1.0 < parsed <= 10.0:
+        return parsed / 10.0
+    if 10.0 < parsed <= 100.0:
+        return parsed / 100.0
+    return None
+
+
 def _extract_json_candidates(raw_text: str) -> list[str]:
     candidates = [match.group(1).strip() for match in JSON_BLOCK_RE.finditer(raw_text)]
 
@@ -112,9 +125,9 @@ def _normalize_prediction(structured_json: dict[str, Any]) -> dict[str, Any] | N
             else prediction_raw.get("numeric_value")
         ),
         "unit": prediction_raw.get("unit"),
-        "probability": _to_float(prediction_raw.get("probability")),
+        "probability": _normalize_unit_interval_score(prediction_raw.get("probability")),
         "label": prediction_raw.get("label"),
-        "confidence": _to_float(prediction_raw.get("confidence")),
+        "confidence": _normalize_unit_interval_score(prediction_raw.get("confidence")),
     }
 
     has_required = any(
@@ -151,7 +164,7 @@ def _normalize_evidence(structured_json: dict[str, Any]) -> list[dict[str, Any]]
                     or item.get("reason")
                     or ""
                 ).strip(),
-                "confidence": _to_float(item.get("confidence")),
+                "confidence": _normalize_unit_interval_score(item.get("confidence")),
                 "source_tag": str(item.get("source_tag") or item.get("tag") or "").strip() or None,
             }
         else:

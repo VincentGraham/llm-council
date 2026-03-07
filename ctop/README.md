@@ -32,6 +32,11 @@ Disable or change cadence with:
 - `--checkpoint-every-trials 0` (disable)
 - `--checkpoint-every-trials 1` (save every trial)
 
+Per-evidence counterfactual reruns are now bounded-parallel by default to reduce single-trial wall time:
+
+- `--counterfactual-max-concurrency 2` (default)
+- Increase to `3` or `4` only if your NIM services still have headroom
+
 Default runtime UI uses a two-line progress display:
 
 - line 1: tqdm progress bar with live metrics (`ema@1m`, `hit@1m`, `mae`, `rmse`, `f1@12m`)

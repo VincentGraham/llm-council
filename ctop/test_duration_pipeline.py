@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 from pathlib import Path
 import sys
@@ -64,7 +65,7 @@ def _input_dataframe() -> pd.DataFrame:
 
 def _baseline_result(evidence_count: int = 2) -> dict:
     evidence = [
-        {"evidence_id": f"s-r3-chair-ev-{index:02d}"}
+        {"evidence_id": f"s-r3-chair-ev-{index:02d}", "maskable": True}
         for index in range(1, evidence_count + 1)
     ]
     return {
@@ -135,6 +136,7 @@ class DurationPipelineTest(unittest.IsolatedAsyncioTestCase):
                 rounds=3,
                 counterfactual_enabled=True,
                 allow_fuzzy_quotes=False,
+                counterfactual_max_concurrency=2,
                 show_progress=False,
             )
 
@@ -171,6 +173,7 @@ class DurationPipelineTest(unittest.IsolatedAsyncioTestCase):
                 rounds=3,
                 counterfactual_enabled=True,
                 allow_fuzzy_quotes=False,
+                counterfactual_max_concurrency=2,
                 show_progress=False,
             )
 
@@ -206,6 +209,7 @@ class DurationPipelineTest(unittest.IsolatedAsyncioTestCase):
                 rounds=3,
                 counterfactual_enabled=True,
                 allow_fuzzy_quotes=False,
+                counterfactual_max_concurrency=2,
                 show_progress=False,
             )
 
@@ -255,6 +259,7 @@ class DurationPipelineTest(unittest.IsolatedAsyncioTestCase):
                 rounds=3,
                 counterfactual_enabled=True,
                 allow_fuzzy_quotes=False,
+                counterfactual_max_concurrency=2,
                 show_progress=False,
             )
 
@@ -279,6 +284,7 @@ class DurationPipelineTest(unittest.IsolatedAsyncioTestCase):
                 prediction_target="duration",
                 rounds=3,
                 counterfactual=True,
+                counterfactual_max_concurrency=2,
                 allow_fuzzy_quotes=False,
                 max_trials=None,
                 epsilon_months=1.0,
@@ -365,6 +371,72 @@ class DurationPipelineTest(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(snapshots, [(1, 1)])
+
+    async def test_unmaskable_counterfactual_evidence_is_skipped(self) -> None:
+        input_df = _input_dataframe()
+        baseline_result = _baseline_result(evidence_count=2)
+        baseline_result["synthesis"]["evidence"] = [
+            {"evidence_id": "s-r3-chair-ev-01", "maskable": False},
+            {"evidence_id": "s-r3-chair-ev-02", "maskable": False},
+        ]
+
+        with patch(
+            "ctop.run_duration_pipeline.run_deliberation",
+            new=AsyncMock(return_value=baseline_result),
+        ), patch(
+            "ctop.run_duration_pipeline.run_counterfactual_deliberation",
+            new=AsyncMock(),
+        ) as cf_mock:
+            long_df, wide_df, _ = await run_duration_pipeline(
+                input_df=input_df,
+                run_id="run12345",
+                prediction_target="duration",
+                rounds=2,
+                counterfactual_enabled=True,
+                allow_fuzzy_quotes=False,
+                counterfactual_max_concurrency=2,
+                show_progress=False,
+            )
+
+        self.assertEqual(cf_mock.await_count, 0)
+        self.assertEqual(len(long_df), 1)
+        self.assertEqual(int(wide_df.iloc[0]["cf_total"]), 0)
+
+    async def test_counterfactuals_respect_bounded_concurrency(self) -> None:
+        input_df = _input_dataframe()
+        in_flight = 0
+        max_in_flight = 0
+        call_index = 0
+
+        async def fake_counterfactual(**_: object) -> dict:
+            nonlocal in_flight, max_in_flight, call_index
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            await asyncio.sleep(0.01)
+            call_index += 1
+            in_flight -= 1
+            return _cf_result(f"cf-batch-{call_index}", f"cf-prompt-{call_index}", 9.0)
+
+        with patch(
+            "ctop.run_duration_pipeline.run_deliberation",
+            new=AsyncMock(return_value=_baseline_result(evidence_count=3)),
+        ), patch(
+            "ctop.run_duration_pipeline.run_counterfactual_deliberation",
+            side_effect=fake_counterfactual,
+        ):
+            long_df, _, _ = await run_duration_pipeline(
+                input_df=input_df,
+                run_id="run12345",
+                prediction_target="duration",
+                rounds=3,
+                counterfactual_enabled=True,
+                allow_fuzzy_quotes=False,
+                counterfactual_max_concurrency=2,
+                show_progress=False,
+            )
+
+        self.assertEqual(len(long_df[long_df["run_type"] == "counterfactual"]), 3)
+        self.assertEqual(max_in_flight, 2)
 
     async def test_progress_reconcile_fills_missing_units(self) -> None:
         input_df = _input_dataframe()

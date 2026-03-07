@@ -135,7 +135,12 @@ def _primary_prompt_from_request(request_payload: dict[str, Any]) -> str:
                 "Target-specific guidance: predict the TOTAL trial duration from study "
                 "initialization/start to completion of the primary endpoint "
                 "(primary completion date). Do not predict intervention/treatment "
-                "duration or follow-up-only windows unless they represent the full trial."
+                "duration or follow-up-only windows unless they represent the full trial. "
+                "Predict the duration for the specific trial or protocol in this record, "
+                "not the lifespan of a broader network, consortium, grant, or disease "
+                "program. Prefer explicit protocol dates, visit schedules, enrollment "
+                "windows, treatment duration, and primary-endpoint timing over broad "
+                "historical context."
             )
         target_line = (
             f"Prediction target: {prediction_target}.\n"
@@ -162,7 +167,7 @@ The JSON must contain:
 - prediction: {task_type, value_text, value_numeric, unit, probability, label, confidence}
 - evidence: array of 3 to 5 items
 Each evidence item must include: {quote, rationale, confidence, source_tag}
-Use quote values copied from the source text whenever possible."""
+Use exact verbatim quote values copied from the source text, not paraphrases."""
 
 
 ROUND_N_RANKING_INSTRUCTIONS = """Also include a FINAL RANKING section in your narrative before the JSON block:
@@ -574,25 +579,21 @@ async def round_1(
         generation_params=generation_params,
     )
 
-    round_responses = []
-    for model in active_members:
+    async def build_round_response(model: str) -> dict[str, Any]:
         response = responses.get(model)
         if response is None:
-            round_responses.append(
-                {
-                    "model": model,
-                    "response": "",
-                    "prediction": None,
-                    "evidence": [],
-                    "structured_json": None,
-                    "structured_parse_status": "failed",
-                    "structured_parse_errors": ["no_response_from_model"],
-                    "usage": None,
-                    "status": "error",
-                    "error": "No response from model",
-                }
-            )
-            continue
+            return {
+                "model": model,
+                "response": "",
+                "prediction": None,
+                "evidence": [],
+                "structured_json": None,
+                "structured_parse_status": "failed",
+                "structured_parse_errors": ["no_response_from_model"],
+                "usage": None,
+                "status": "error",
+                "error": "No response from model",
+            }
 
         raw_text = response.get("content", "")
         structured = await _parse_and_attach_structure(
@@ -600,21 +601,21 @@ async def round_1(
             request_payload=request_payload,
             evidence_id_prefix=f"r1-{model}",
         )
-        round_responses.append(
-            {
-                "model": model,
-                "raw_response": raw_text,
-                "response": structured["response"],
-                "prediction": structured["prediction"],
-                "evidence": structured["evidence"],
-                "structured_json": structured["structured_json"],
-                "structured_parse_status": structured["structured_parse_status"],
-                "structured_parse_errors": structured["structured_parse_errors"],
-                "reasoning_details": response.get("reasoning_details"),
-                "usage": _normalize_usage(response.get("usage")),
-                "status": "ok",
-            }
-        )
+        return {
+            "model": model,
+            "raw_response": raw_text,
+            "response": structured["response"],
+            "prediction": structured["prediction"],
+            "evidence": structured["evidence"],
+            "structured_json": structured["structured_json"],
+            "structured_parse_status": structured["structured_parse_status"],
+            "structured_parse_errors": structured["structured_parse_errors"],
+            "reasoning_details": response.get("reasoning_details"),
+            "usage": _normalize_usage(response.get("usage")),
+            "status": "ok",
+        }
+
+    round_responses = await asyncio.gather(*(build_round_response(model) for model in active_members))
 
     return {
         "round": 1,
@@ -748,28 +749,24 @@ async def round_n(
         generation_params=generation_params,
     )
 
-    round_responses = []
-    for model in active_members:
+    async def build_round_response(model: str) -> dict[str, Any]:
         response = responses.get(model)
         if response is None:
-            round_responses.append(
-                {
-                    "model": model,
-                    "response": "",
-                    "review": "",
-                    "prediction": None,
-                    "evidence": [],
-                    "structured_json": None,
-                    "structured_parse_status": "failed",
-                    "structured_parse_errors": ["no_response_from_model"],
-                    "parsed_ranking": [],
-                    "label_to_model": label_maps[model],
-                    "usage": None,
-                    "status": "error",
-                    "error": "No response from model",
-                }
-            )
-            continue
+            return {
+                "model": model,
+                "response": "",
+                "review": "",
+                "prediction": None,
+                "evidence": [],
+                "structured_json": None,
+                "structured_parse_status": "failed",
+                "structured_parse_errors": ["no_response_from_model"],
+                "parsed_ranking": [],
+                "label_to_model": label_maps[model],
+                "usage": None,
+                "status": "error",
+                "error": "No response from model",
+            }
 
         raw_text = response.get("content", "")
         structured = await _parse_and_attach_structure(
@@ -777,24 +774,24 @@ async def round_n(
             request_payload=request_payload,
             evidence_id_prefix=f"r{n}-{model}",
         )
-        round_responses.append(
-            {
-                "model": model,
-                "raw_response": raw_text,
-                "response": structured["response"],
-                "review": structured["response"],
-                "prediction": structured["prediction"],
-                "evidence": structured["evidence"],
-                "structured_json": structured["structured_json"],
-                "structured_parse_status": structured["structured_parse_status"],
-                "structured_parse_errors": structured["structured_parse_errors"],
-                "parsed_ranking": parse_ranking_from_text(raw_text),
-                "label_to_model": label_maps[model],
-                "reasoning_details": response.get("reasoning_details"),
-                "usage": _normalize_usage(response.get("usage")),
-                "status": "ok",
-            }
-        )
+        return {
+            "model": model,
+            "raw_response": raw_text,
+            "response": structured["response"],
+            "review": structured["response"],
+            "prediction": structured["prediction"],
+            "evidence": structured["evidence"],
+            "structured_json": structured["structured_json"],
+            "structured_parse_status": structured["structured_parse_status"],
+            "structured_parse_errors": structured["structured_parse_errors"],
+            "parsed_ranking": parse_ranking_from_text(raw_text),
+            "label_to_model": label_maps[model],
+            "reasoning_details": response.get("reasoning_details"),
+            "usage": _normalize_usage(response.get("usage")),
+            "status": "ok",
+        }
+
+    round_responses = await asyncio.gather(*(build_round_response(model) for model in active_members))
 
     aggregate_rankings = calculate_aggregate_rankings(round_responses)
     return {

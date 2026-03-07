@@ -159,6 +159,8 @@ class CouncilDynamicsTest(unittest.TestCase):
         self.assertIn("TOTAL trial duration", prompt)
         self.assertIn("primary endpoint", prompt)
         self.assertIn("Do not predict intervention/treatment duration", prompt)
+        self.assertIn("specific trial or protocol", prompt)
+        self.assertIn("not the lifespan of a broader network", prompt)
 
     def test_primary_prompt_non_duration_target_has_no_duration_guidance(self) -> None:
         prompt = _primary_prompt_from_request(

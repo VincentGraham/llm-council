@@ -1,7 +1,7 @@
 services:
-  llama-3-1-nemotron-70b-instruct:
-    image: nvcr.io/nim/nvidia/llama-3_1-nemotron-70b-instruct:latest
-    container_name: nim-llama-3-1-nemotron-70b-instruct
+  llama-3-3-nemotron-super-49b-v1-5:
+    image: nvcr.io/nim/nvidia/llama-3.3-nemotron-super-49b-v1.5:latest
+    container_name: nim-llama-3-3-nemotron-super-49b-v1-5
     ipc: host
     ulimits:
       memlock: -1
@@ -36,9 +36,9 @@ services:
       retries: 40
       start_period: 120s
     restart: unless-stopped
-  llama-3-3-nemotron-super-49b-v1:
-    image: nvcr.io/nim/nvidia/llama-3_3-nemotron-super-49b-v1:latest
-    container_name: nim-llama-3-3-nemotron-super-49b-v1
+  llama-3-1-nemotron-70b-instruct:
+    image: nvcr.io/nim/nvidia/llama-3_1-nemotron-70b-instruct:latest
+    container_name: nim-llama-3-1-nemotron-70b-instruct
     ipc: host
     ulimits:
       memlock: -1
@@ -73,9 +73,9 @@ services:
       retries: 40
       start_period: 120s
     restart: unless-stopped
-  qwen2-5-32b-instruct:
-    image: nvcr.io/nim/qwen/qwen2_5-32b-instruct:latest
-    container_name: nim-qwen2-5-32b-instruct
+  llama-3-3-nemotron-super-49b-v1:
+    image: nvcr.io/nim/nvidia/llama-3_3-nemotron-super-49b-v1:latest
+    container_name: nim-llama-3-3-nemotron-super-49b-v1
     ipc: host
     ulimits:
       memlock: -1
@@ -110,9 +110,9 @@ services:
       retries: 40
       start_period: 120s
     restart: unless-stopped
-  llama-3-3-nemotron-super-49b-v1-b:
-    image: nvcr.io/nim/nvidia/llama-3_3-nemotron-super-49b-v1:latest
-    container_name: nim-llama-3-3-nemotron-super-49b-v1-b
+  nemotron-3-nano:
+    image: nvcr.io/nim/nvidia/nemotron-3-nano:latest
+    container_name: nim-nemotron-3-nano
     ipc: host
     ulimits:
       memlock: -1

@@ -82,6 +82,22 @@ class EvidenceUtilsTest(unittest.TestCase):
         self.assertTrue(parsed["evidence"][0]["maskable"])
         self.assertEqual(parsed["evidence"][0]["match_type"], "fuzzy")
 
+    def test_parse_hybrid_output_normalizes_scores_to_unit_interval(self) -> None:
+        raw = """Narrative.\n```json\n{\n  "prediction": {"task_type": "duration", "probability": 80, "confidence": 6},\n  "evidence": [\n    {"quote": "Primary endpoint met", "rationale": "efficacy", "confidence": 9},\n    {"quote": "sample size was 850", "rationale": "precision", "confidence": 70},\n    {"quote": "double blind", "rationale": "bias control", "confidence": 0.6}\n  ]\n}\n```"""
+        source = "Primary endpoint met in phase 3. sample size was 850. It was double blind."
+        parsed = asyncio.run(
+            parse_hybrid_output(
+                raw_text=raw,
+                source_text=source,
+                evidence_id_prefix="t4",
+                allow_fuzzy_quotes=False,
+            )
+        )
+        self.assertEqual(parsed["prediction"]["probability"], 0.8)
+        self.assertEqual(parsed["prediction"]["confidence"], 0.6)
+        self.assertEqual(parsed["evidence"][0]["confidence"], 0.9)
+        self.assertEqual(parsed["evidence"][1]["confidence"], 0.7)
+
     def test_select_evidence_union(self) -> None:
         evidence_index = [
             {
